@@ -1,0 +1,7 @@
+numpy>=1.26.0
+pandas>=2.2.0
+requests>=2.31.0
+
+# Broker SDKs (uncomment the one you use)
+# kiteconnect>=5.0.1
+# upstox-client>=2.8.0
