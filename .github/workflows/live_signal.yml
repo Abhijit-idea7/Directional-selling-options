@@ -1,0 +1,124 @@
+name: Live Signal
+
+# Triggers every 5 minutes on weekdays, 09:10 to 15:20 IST
+# IST = UTC+5:30 → market hours in UTC: 03:40–09:50
+# GitHub cron uses UTC.
+#
+# Note: GitHub Actions cron can drift by a few minutes — the adapter handles
+# this gracefully by skipping bars outside market hours.
+#
+# Also triggered manually via workflow_dispatch for testing.
+
+on:
+  schedule:
+    # Every 5 min, Mon–Fri, 03:45–09:45 UTC (≈ 09:15–15:15 IST)
+    - cron: "45,50,55 3 * * 1-5"
+    - cron: "0,5,10,15,20,25,30,35,40,45,50,55 4 * * 1-5"
+    - cron: "0,5,10,15,20,25,30,35,40,45,50,55 5 * * 1-5"
+    - cron: "0,5,10,15,20,25,30,35,40,45,50,55 6 * * 1-5"
+    - cron: "0,5,10,15,20,25,30,35,40,45,50,55 7 * * 1-5"
+    - cron: "0,5,10,15,20,25,30,35,40,45,50,55 8 * * 1-5"
+    - cron: "0,5,10,15,20,25,30,35,40 9 * * 1-5"
+
+  workflow_dispatch:
+    inputs:
+      paper_trade:
+        description: "Paper trade (true/false)"
+        default: "true"
+        required: false
+
+concurrency:
+  group: live-signal
+  cancel-in-progress: true   # prevent overlapping runs
+
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check market hours (IST)
+        id: market_check
+        run: |
+          # Convert current UTC to IST and verify within 09:15–15:15
+          HOUR_IST=$(TZ="Asia/Kolkata" date +%H)
+          MIN_IST=$(TZ="Asia/Kolkata" date +%M)
+          TIME_INT=$((HOUR_IST * 100 + MIN_IST))
+          echo "IST time: ${HOUR_IST}:${MIN_IST} (${TIME_INT})"
+          if [ "$TIME_INT" -lt 915 ] || [ "$TIME_INT" -gt 1515 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip if outside market hours
+        if: steps.market_check.outputs.skip == 'true'
+        run: |
+          echo "Outside market hours — skipping."
+          exit 0
+
+      - name: Checkout
+        if: steps.market_check.outputs.skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: steps.market_check.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        if: steps.market_check.outputs.skip != 'true'
+        run: pip install -r requirements.txt
+
+      # ── Restore position state from previous run ──────────────────────────
+      - name: Restore position state
+        if: steps.market_check.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: state/
+          key: position-state-${{ github.run_id }}
+          restore-keys: |
+            position-state-
+
+      # ── Generate live signal ───────────────────────────────────────────────
+      - name: Generate signal
+        if: steps.market_check.outputs.skip != 'true'
+        env:
+          BROKER_API_KEY:      ${{ secrets.BROKER_API_KEY }}
+          BROKER_ACCESS_TOKEN: ${{ secrets.BROKER_ACCESS_TOKEN }}
+          BROKER_TYPE:         ${{ secrets.BROKER_TYPE }}
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+          PAPER_TRADE:         ${{ github.event.inputs.paper_trade || 'true' }}
+        run: |
+          mkdir -p results state
+          python live_trading_adapter.py
+
+      # ── Execute order (if signal changed) ─────────────────────────────────
+      - name: Execute signal
+        if: steps.market_check.outputs.skip != 'true'
+        env:
+          BROKER_API_KEY:      ${{ secrets.BROKER_API_KEY }}
+          BROKER_ACCESS_TOKEN: ${{ secrets.BROKER_ACCESS_TOKEN }}
+          BROKER_TYPE:         ${{ secrets.BROKER_TYPE }}
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+          PAPER_TRADE:         ${{ github.event.inputs.paper_trade || 'true' }}
+        run: |
+          python signal_executor.py --state-dir state --signal-dir results
+
+      # ── Save position state for next run ──────────────────────────────────
+      - name: Save position state
+        if: steps.market_check.outputs.skip != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: state/
+          key: position-state-${{ github.run_id }}
+
+      - name: Upload signal snapshot
+        if: steps.market_check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: signal-${{ github.run_number }}
+          path: results/current_signal.json
+          retention-days: 7

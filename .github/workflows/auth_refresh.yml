@@ -1,0 +1,74 @@
+name: Auth Token Refresh
+
+# Runs at 08:45 IST (03:15 UTC) on weekdays — before market open.
+# Zerodha and most brokers issue a new access token each day via login flow.
+#
+# Two approaches:
+#   A) Automated (headless Selenium/Playwright login) — complex but fully hands-off
+#   B) Manual trigger + repo secret update — simpler and more reliable
+#
+# This workflow uses approach B: it calls a custom auth script that you
+# provide, which should output a new access token to stdout.
+# The token is then saved as a GitHub Actions secret via the GitHub API.
+#
+# Set up:
+#   1. Create GITHUB_PAT secret with repo scope (for updating secrets)
+#   2. Create BROKER_TOTP_SECRET (TOTP seed for 2FA — Zerodha uses TOTP)
+#   3. Fill in the auth script for your broker below
+
+on:
+  schedule:
+    - cron: "15 3 * * 1-5"    # 08:45 IST = 03:15 UTC, Mon–Fri
+  workflow_dispatch:
+
+jobs:
+  refresh_token:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyotp                 # for TOTP generation
+
+      - name: Refresh access token
+        id: auth
+        env:
+          BROKER_API_KEY:    ${{ secrets.BROKER_API_KEY }}
+          BROKER_API_SECRET: ${{ secrets.BROKER_API_SECRET }}
+          BROKER_TOTP_SECRET: ${{ secrets.BROKER_TOTP_SECRET }}
+          BROKER_USER_ID:    ${{ secrets.BROKER_USER_ID }}
+          BROKER_PASSWORD:   ${{ secrets.BROKER_PASSWORD }}
+          BROKER_TYPE:       ${{ secrets.BROKER_TYPE }}
+        run: |
+          TOKEN=$(python auth/refresh_token.py)
+          echo "access_token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Update BROKER_ACCESS_TOKEN secret
+        uses: gliech/create-github-secret-action@v1
+        with:
+          pa_token: ${{ secrets.GITHUB_PAT }}
+          name: BROKER_ACCESS_TOKEN
+          value: ${{ steps.auth.outputs.access_token }}
+
+      - name: Notify
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -c "
+          import os, requests
+          bot = os.getenv('TELEGRAM_BOT_TOKEN','')
+          chat = os.getenv('TELEGRAM_CHAT_ID','')
+          if bot and chat:
+              requests.post(f'https://api.telegram.org/bot{bot}/sendMessage',
+                  json={'chat_id': chat, 'text': '✅ Broker token refreshed. Strategy active.'})
+          "
