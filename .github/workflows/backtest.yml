@@ -1,0 +1,73 @@
+name: Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Days of synthetic data (if no CSV uploaded)"
+        default: "60"
+        required: false
+      data_csv:
+        description: "Path to OHLCV CSV in repo (leave blank for synthetic data)"
+        default: ""
+        required: false
+      entry_threshold:
+        description: "Entry threshold (composite score |x| > this)"
+        default: "0.25"
+        required: false
+      stop_loss_pct:
+        description: "Stop-loss % on underlying (e.g. 0.008 = 0.8%)"
+        default: "0.008"
+        required: false
+      lots:
+        description: "Number of lots"
+        default: "1"
+        required: false
+  push:
+    branches: [main]
+    paths:
+      - "multi_factor_nifty_strategy.py"
+      - "data/**"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run backtest
+        run: |
+          mkdir -p results
+          python multi_factor_nifty_strategy.py \
+            --mode backtest \
+            --days "${{ github.event.inputs.days || '60' }}" \
+            --entry-threshold "${{ github.event.inputs.entry_threshold || '0.25' }}" \
+            --stop-loss-pct "${{ github.event.inputs.stop_loss_pct || '0.008' }}" \
+            --lots "${{ github.event.inputs.lots || '1' }}" \
+            ${{ github.event.inputs.data_csv && format('--data-csv "{0}"', github.event.inputs.data_csv) || '' }} \
+            --output-dir results
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results-${{ github.run_number }}
+          path: results/
+          retention-days: 30
+
+      - name: Print summary to workflow log
+        run: cat results/summary.json
+
+      - name: Comment summary on commit (optional)
+        if: github.event_name == 'push'
+        run: |
+          echo "Backtest complete. Download artifact 'backtest-results-${{ github.run_number }}' for full results."
