@@ -254,8 +254,8 @@ class FactorEngine:
     # F9 – Opening Range Breakout ----------------------------------------------
     def _f9_opening_range(self, df: pd.DataFrame) -> pd.DataFrame:
         df['_date'] = df.index.date
-        or_end_time = pd.to_timedelta(self.cfg.market_open) + \
-                      pd.to_timedelta(f"{self.cfg.or_minutes}min")
+        h, m = map(int, self.cfg.market_open.split(":"))
+        or_end_time = pd.Timedelta(hours=h, minutes=m + self.cfg.or_minutes)
 
         def _or_for_day(g):
             g = g.copy()
