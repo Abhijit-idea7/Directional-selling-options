@@ -117,17 +117,27 @@ class StockConfig:
 
     # Signal thresholds
     entry_threshold:    float = 0.35        # raised vs index (stocks noisier)
-    exit_threshold:     float = 0.20        # wider band → fewer noise exits
+    exit_threshold:     float = 0.28        # raised — score must nearly-reverse before exit
 
-    # Signal quality filters (the key fixes from diagnostic)
-    min_confirm_bars:   int   = 3           # score must stay above threshold for N bars
-    min_hold_bars:      int   = 5           # don't exit within first N bars of entry
-    lunch_filter:       bool  = True        # skip 12:00–13:30 (low volume, noisy)
+    # Signal quality filters
+    min_confirm_bars:   int   = 3           # N consecutive bars above threshold → entry
+    exit_confirm_bars:  int   = 3           # N consecutive bars below exit_threshold → exit
+    min_hold_bars:      int   = 15          # don't exit within first 15 bars (30 min)
+    lunch_filter:       bool  = True        # skip 12:00–13:30 entries (low volume)
+
+    # IC-based dynamic factor weighting (Fundamental Law: w ∝ IC × 1/Σ|corr|)
+    use_ic_weights:     bool  = True        # enable predictive-power weighting
+    ic_lookback:        int   = 60          # bars to estimate rolling IC per factor
+    ic_min_obs:         int   = 20          # min observations required to compute IC
+
+    # ADX trend-regime filter: only enter when market is trending
+    adx_trend_filter:   bool  = True        # require |f4| > adx_trend_min to enter
+    adx_trend_min:      float = 0.10        # normalized ADX threshold (|f4| proxy)
 
     # Risk / sizing
     capital_per_stock:  float = 50_000.0   # ₹ allocated per stock per day
     stop_loss_pct:      float = 0.006       # 0.6% move against position
-    max_trades_per_day: int   = 3           # reduced from 6 to cut churn
+    max_trades_per_day: int   = 3           # cap trades per stock per day
 
     # Universe filter
     exclude_commodity:  bool  = True        # drop PSU/commodity stocks
@@ -156,6 +166,9 @@ class StockConfig:
             corr_lookback     = self.corr_lookback,
             entry_threshold   = self.entry_threshold,
             exit_threshold    = self.exit_threshold,
+            use_ic_weights    = self.use_ic_weights,
+            ic_lookback       = self.ic_lookback,
+            ic_min_obs        = self.ic_min_obs,
         )
 
 
@@ -374,17 +387,21 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
     lunch_start   = pd.Timestamp("12:00").time()
     lunch_end     = pd.Timestamp("13:30").time()
 
+    exit_confirm_count = 0   # consecutive bars score has been below exit_threshold
+
     for ts, row in signal_df.iterrows():
         t     = ts.time()
         price = row['close']
         score = row.get('composite_score', np.nan)
+        f4    = row.get('f4', np.nan)   # ADX-directional factor (proxy for trend strength)
 
         # Reset daily counters at session start
         if ts.date() != last_date:
-            last_date     = ts.date()
-            trades_today  = 0
-            confirm_long  = 0
-            confirm_short = 0
+            last_date          = ts.date()
+            trades_today       = 0
+            confirm_long       = 0
+            confirm_short      = 0
+            exit_confirm_count = 0
 
         # Skip pre-signal bars
         if t < signal_start:
@@ -408,8 +425,9 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                     exit_cost   = cost,
                     exit_reason = 'squareoff',
                 ))
-                position      = None
-                bars_in_position = 0
+                position           = None
+                bars_in_position   = 0
+                exit_confirm_count = 0
             continue
 
         if np.isnan(score):
@@ -417,7 +435,14 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
             confirm_short = 0
             continue
 
-        # ── Update confirmation counters ─────────────────────────────────────
+        # ── ADX trend-regime filter ──────────────────────────────────────────
+        # f4 = (DI_diff × ADX/100): |f4| large → strong trend in some direction
+        # Only matters at entry — we don't force-exit a position if trend fades
+        adx_ok = (not cfg.adx_trend_filter or
+                  np.isnan(f4) or
+                  abs(f4) >= cfg.adx_trend_min)
+
+        # ── Update entry confirmation counters ───────────────────────────────
         if score >= cfg.entry_threshold:
             confirm_long  += 1
             confirm_short  = 0
@@ -428,7 +453,15 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
             confirm_long  = 0
             confirm_short = 0
 
-        # ── Determine desired side (requires N consecutive confirming bars) ───
+        # ── Update exit confirmation counter ─────────────────────────────────
+        # Counts consecutive bars the score has been below the exit level.
+        # Mirrors the entry filter: N bars of weakness needed before exiting.
+        if position is not None and abs(score) < cfg.exit_threshold:
+            exit_confirm_count += 1
+        else:
+            exit_confirm_count = 0
+
+        # ── Determine desired side (N consecutive confirming bars) ────────────
         if confirm_long  >= cfg.min_confirm_bars:
             desired = 'long'
         elif confirm_short >= cfg.min_confirm_bars:
@@ -436,7 +469,7 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
         else:
             desired = None
 
-        # ── Lunch filter: no new entries, but hold existing positions ─────────
+        # ── Lunch filter: no new entries; hold / manage existing positions ────
         in_lunch = cfg.lunch_filter and lunch_start <= t <= lunch_end
 
         # ── Track bars in position ────────────────────────────────────────────
@@ -444,8 +477,9 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
             bars_in_position += 1
             past_min_hold = bars_in_position >= cfg.min_hold_bars
         else:
-            bars_in_position = 0
-            past_min_hold    = True
+            bars_in_position   = 0
+            exit_confirm_count = 0
+            past_min_hold      = True
 
         # ── Check stop-loss (always active, even within min-hold period) ──────
         if position is not None:
@@ -471,15 +505,16 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                     exit_cost   = cost,
                     exit_reason = 'stop_loss',
                 ))
-                position         = None
-                bars_in_position = 0
-                past_min_hold    = True
+                position           = None
+                bars_in_position   = 0
+                exit_confirm_count = 0
+                past_min_hold      = True
 
         # ── Position management ───────────────────────────────────────────────
         if position is None:
-            # Only enter outside lunch and if budget allows
-            if desired is not None and not in_lunch and \
-               trades_today < cfg.max_trades_per_day:
+            # Enter: need confirmed signal + trending regime + not lunch + budget
+            if (desired is not None and adx_ok and not in_lunch
+                    and trades_today < cfg.max_trades_per_day):
                 qty  = max(1, int(cfg.capital_per_stock / price))
                 cost = compute_costs(price, qty,
                                      'buy' if desired == 'long' else 'sell', cfg)
@@ -493,8 +528,9 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                     'entry_cost':  cost,
                     'sl_price':    sl,
                 }
-                bars_in_position = 0
-                trades_today    += 1
+                bars_in_position   = 0
+                exit_confirm_count = 0
+                trades_today      += 1
         else:
             cur_side = position['side']
             # Respect min_hold_bars before any signal-driven exit
@@ -502,7 +538,7 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                 continue
 
             if desired is not None and desired != cur_side:
-                # Reverse (SAR) — only outside lunch
+                # ── Signal reversal (SAR) ─────────────────────────────────────
                 exit_cost = compute_costs(price, position['qty'],
                                           'sell' if cur_side == 'long' else 'buy',
                                           cfg)
@@ -518,10 +554,11 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                     exit_cost   = exit_cost,
                     exit_reason = 'signal_switch',
                 ))
-                position         = None
-                bars_in_position = 0
-                # Open reverse only outside lunch and within budget
-                if not in_lunch and trades_today < cfg.max_trades_per_day:
+                position           = None
+                bars_in_position   = 0
+                exit_confirm_count = 0
+                # Immediately open reverse leg (outside lunch only)
+                if not in_lunch and adx_ok and trades_today < cfg.max_trades_per_day:
                     qty  = max(1, int(cfg.capital_per_stock / price))
                     cost = compute_costs(price, qty,
                                          'buy' if desired == 'long' else 'sell', cfg)
@@ -537,8 +574,12 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                     }
                     trades_today += 1
 
-            elif desired is None and abs(score) < cfg.exit_threshold:
-                # Score collapsed below exit threshold → exit to flat
+            elif (desired is None
+                  and abs(score) < cfg.exit_threshold
+                  and exit_confirm_count >= cfg.exit_confirm_bars):
+                # ── Signal_neutral exit: score weak for N consecutive bars ─────
+                # Mirrors entry confirmation — exits require sustained weakness,
+                # not just a single-bar dip below exit_threshold.
                 exit_cost = compute_costs(price, position['qty'],
                                           'sell' if cur_side == 'long' else 'buy',
                                           cfg)
@@ -554,7 +595,8 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                     exit_cost   = exit_cost,
                     exit_reason = 'signal_neutral',
                 ))
-                position = None
+                position           = None
+                exit_confirm_count = 0
 
     return trades
 
@@ -760,16 +802,24 @@ def _parse():
     p.add_argument("--exit-thr",         type=float, default=0.20,
                    help="Exit threshold (0.20 default — wider hysteresis band)")
     p.add_argument("--stop-pct",         type=float, default=0.006)
-    p.add_argument("--min-confirm-bars", type=int,   default=3,
-                   help="Consecutive bars score must exceed threshold before entry")
-    p.add_argument("--min-hold-bars",    type=int,   default=5,
-                   help="Minimum bars to hold before signal-driven exit")
-    p.add_argument("--max-trades-day",   type=int,   default=3,
+    p.add_argument("--min-confirm-bars",  type=int,   default=3,
+                   help="Consecutive bars above entry_thr required before entry")
+    p.add_argument("--exit-confirm-bars", type=int,   default=3,
+                   help="Consecutive bars below exit_thr required before signal_neutral exit")
+    p.add_argument("--min-hold-bars",     type=int,   default=15,
+                   help="Minimum bars to hold before any signal-driven exit (default=15=30 min)")
+    p.add_argument("--max-trades-day",    type=int,   default=3,
                    help="Maximum trades per stock per day")
-    p.add_argument("--no-lunch-filter",  action="store_true",
+    p.add_argument("--no-lunch-filter",   action="store_true",
                    help="Disable the 12:00–13:30 lunch-hour entry filter")
     p.add_argument("--include-commodity", action="store_true",
                    help="Include commodity/PSU stocks (excluded by default)")
+    p.add_argument("--no-ic-weights",     action="store_true",
+                   help="Disable IC-based factor weights (use independence-only)")
+    p.add_argument("--no-adx-filter",     action="store_true",
+                   help="Disable ADX trend-regime entry filter")
+    p.add_argument("--adx-trend-min",     type=float, default=0.10,
+                   help="Minimum |f4| (normalized ADX proxy) required for entry")
     p.add_argument("--output-dir",       type=str,   default="results_stocks")
     p.add_argument("--workers",          type=int,   default=8,
                    help="Parallel workers for per-stock factor computation")
@@ -787,11 +837,21 @@ if __name__ == "__main__":
         exit_threshold     = args.exit_thr,
         stop_loss_pct      = args.stop_pct,
         min_confirm_bars   = args.min_confirm_bars,
+        exit_confirm_bars  = args.exit_confirm_bars,
         min_hold_bars      = args.min_hold_bars,
         max_trades_per_day = args.max_trades_day,
         lunch_filter       = not args.no_lunch_filter,
         exclude_commodity  = not args.include_commodity,
+        use_ic_weights     = not args.no_ic_weights,
+        adx_trend_filter   = not args.no_adx_filter,
+        adx_trend_min      = args.adx_trend_min,
     )
+
+    log.info("Config: entry_thr=%.2f  exit_thr=%.2f  min_confirm=%d  "
+             "exit_confirm=%d  min_hold=%d bars  IC_weights=%s  ADX_filter=%s",
+             cfg.entry_threshold, cfg.exit_threshold, cfg.min_confirm_bars,
+             cfg.exit_confirm_bars, cfg.min_hold_bars,
+             cfg.use_ic_weights, cfg.adx_trend_filter)
 
     if args.symbols:
         symbols = args.symbols.split(",")

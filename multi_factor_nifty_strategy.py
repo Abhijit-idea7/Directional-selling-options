@@ -73,6 +73,11 @@ class StrategyConfig:
     corr_lookback:      int   = 60         # bars for rolling correlation matrix
     min_effective_n:    float = 3.0        # warn if effective N drops below this
 
+    # IC-based dynamic weighting (Fundamental Law: weight ∝ IC × 1/Σ|corr|)
+    use_ic_weights:     bool  = False      # enable IC × independence weighting
+    ic_lookback:        int   = 60         # bars to estimate rolling IC per factor
+    ic_min_obs:         int   = 20         # minimum valid obs to use IC (else equal-w)
+
     # Risk management
     stop_loss_pct:      float = 0.008      # 0.8% move in underlying → exit
     premium_sl_mult:    float = 2.0        # exit if premium > entry_premium × this
@@ -299,53 +304,97 @@ class FactorEngine:
     # Composite Score ----------------------------------------------------------
     def _composite_score(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Combine factors using correlation-adjusted weights (article's IC × √N logic).
+        Combine factors using the full Fundamental Law weighting:
 
-        For each bar:
-          1. Take the rolling lookback window of factor values
-          2. Drop columns that are entirely NaN in the window (avoids NaN cascade)
-          3. Drop rows where ANY remaining factor is NaN
-          4. If ≥ 10 clean rows: compute pairwise correlation matrix
-             Weight(i) ∝ 1 / (sum of |corr| with all others)  → rewards independence
-          5. If < 10 clean rows: fall back to simple equal weights
-          6. Apply weights only to non-NaN factors at the current bar
+            weight(i)  ∝  IC(i)  ×  1 / Σ|corr(i,j)|
+
+        where IC(i) = rank-correlation of factor i with 1-bar forward return,
+        computed over a rolling lookback window (no future data leakage).
+
+        The two components:
+          • IC(i)             = predictive power   (Fundamental Law IC term)
+          • 1/Σ|corr(i,j)|   = independence bonus (the √N diversification term)
+
+        Factors with IC ≤ 0 (no directional prediction) are zeroed out, not
+        negated — a weak factor should be silent, not harmful.
+
+        Mode controlled by cfg.use_ic_weights:
+          False (default) → correlation-independence weights only (prior behaviour)
+          True            → IC × independence weights (full Fundamental Law)
         """
         factor_cols = [f'f{i}' for i in range(1, 11)]
         F        = df[factor_cols].copy()
         lookback = self.cfg.corr_lookback
-        scores   = []
+        use_ic   = getattr(self.cfg, 'use_ic_weights', False)
+        ic_lb    = getattr(self.cfg, 'ic_lookback',    60)
+        ic_min   = getattr(self.cfg, 'ic_min_obs',     20)
+
+        # Pre-compute 1-bar forward return for IC estimation.
+        # At bar t we know f(t) and—within the lookback window—r(t+1) for all
+        # historical bars t' < t. No future data leakage.
+        fwd_ret = df['close'].pct_change().shift(-1)
+
+        scores  = []
 
         for idx in range(len(F)):
-            start  = max(0, idx - lookback + 1)
-            window = F.iloc[start:idx + 1]
+            start      = max(0, idx - lookback + 1)
+            ic_start   = max(0, idx - ic_lb + 1)
 
             # ── Current bar: only use factors that are not NaN ────────────────
-            row_vals = F.iloc[idx]
+            row_vals   = F.iloc[idx]
             valid_mask = row_vals.notna()
             if valid_mask.sum() == 0:
                 scores.append(np.nan)
                 continue
             valid_cols = row_vals.index[valid_mask].tolist()
 
-            # ── Build clean window: only columns/rows that are fully available ─
-            window_valid = window[valid_cols].dropna()
+            # ── Build clean window for correlation ────────────────────────────
+            window_valid = F.iloc[start:idx + 1][valid_cols].dropna()
 
             if window_valid.shape[0] < 10:
-                # Not enough history — plain equal weight over available factors
                 scores.append(float(row_vals[valid_cols].mean()))
                 continue
 
-            # ── Correlation-adjusted weights (independent-signal down-weight) ──
-            corr = window_valid.corr()
-            # Weight ∝ 1 / (total absolute correlation with peers)
-            # A factor that moves with everyone else gets a lower weight
-            raw_w = np.array([
+            # ── Independence weights: 1/Σ|corr(i,j)| ────────────────────────
+            corr  = window_valid.corr()
+            ind_w = np.array([
                 1.0 / max(corr[c].abs().sum() - 1.0, 1e-6)
                 for c in valid_cols
             ])
+            ind_w = np.where(np.isfinite(ind_w), ind_w, 0.0)
+
+            # ── IC weights (Fundamental Law predictive-power term) ────────────
+            if use_ic:
+                # IC window: bars [ic_start, idx-1] so r(t'+1) is historical
+                ic_window_f = F.iloc[ic_start:idx][valid_cols]   # factor values
+                ic_window_r = fwd_ret.iloc[ic_start:idx]          # fwd returns
+
+                ic_w = np.zeros(len(valid_cols))
+                for j, col in enumerate(valid_cols):
+                    f_vals = ic_window_f[col]
+                    r_vals = ic_window_r
+                    both   = f_vals.notna() & r_vals.notna()
+                    n_obs  = both.sum()
+                    if n_obs < ic_min:
+                        ic_w[j] = 1.0 / len(valid_cols)  # not enough data → equal
+                        continue
+                    ic = f_vals[both].rank().corr(r_vals[both].rank())
+                    # Zero out factors with negative or zero IC
+                    ic_w[j] = max(0.0, float(ic) if np.isfinite(ic) else 0.0)
+
+                # If ALL factors have negative IC (regime flip), fall back to
+                # equal weights so we still trade the strongest signal
+                if ic_w.sum() < 1e-8:
+                    ic_w = np.ones(len(valid_cols)) / len(valid_cols)
+
+                raw_w = ind_w * ic_w          # full Fundamental Law weight
+            else:
+                raw_w = ind_w                  # independence-only (prior mode)
+
             raw_w = np.where(np.isfinite(raw_w), raw_w, 0.0)
             w_sum = raw_w.sum()
-            weights = raw_w / w_sum if w_sum > 1e-8 else np.ones(len(valid_cols)) / len(valid_cols)
+            weights = (raw_w / w_sum if w_sum > 1e-8
+                       else np.ones(len(valid_cols)) / len(valid_cols))
 
             scores.append(float(np.dot(weights, row_vals[valid_cols].values)))
 
