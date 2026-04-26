@@ -3,8 +3,16 @@ name: Nifty 50 Stock Backtest
 on:
   workflow_dispatch:
     inputs:
+      data_source:
+        description: "Data source: 'yfinance' (real, last 7 days) or 'synthetic' (faster)"
+        default: "yfinance"
+        required: true
+        type: choice
+        options:
+          - yfinance
+          - synthetic
       days:
-        description: "Days of synthetic data per stock"
+        description: "Days of synthetic data (only used when data_source=synthetic)"
         default: "40"
       capital:
         description: "Capital per stock (₹)"
@@ -16,7 +24,7 @@ on:
         description: "Stop-loss % (e.g. 0.006 = 0.6%)"
         default: "0.006"
       symbols:
-        description: "Comma-separated symbols (blank = all 50)"
+        description: "Comma-separated symbols to test (blank = all 50)"
         default: ""
   push:
     branches: [main]
@@ -39,14 +47,26 @@ jobs:
       - name: Run Nifty 50 stock backtest
         run: |
           mkdir -p results_stocks
-          python nifty50_intraday_backtest.py \
-            --synthetic \
-            --days "${{ github.event.inputs.days || '40' }}" \
-            --capital "${{ github.event.inputs.capital || '50000' }}" \
-            --entry-thr "${{ github.event.inputs.entry_threshold || '0.25' }}" \
-            --stop-pct "${{ github.event.inputs.stop_pct || '0.006' }}" \
-            ${{ github.event.inputs.symbols != '' && format('--symbols "{0}"', github.event.inputs.symbols) || '' }} \
-            --output-dir results_stocks
+
+          # Build the command — only pass --synthetic if explicitly chosen
+          CMD="python nifty50_intraday_backtest.py"
+
+          if [ "${{ github.event.inputs.data_source || 'yfinance' }}" = "synthetic" ]; then
+            CMD="$CMD --synthetic --days ${{ github.event.inputs.days || '40' }}"
+          fi
+
+          CMD="$CMD \
+            --capital ${{ github.event.inputs.capital || '50000' }} \
+            --entry-thr ${{ github.event.inputs.entry_threshold || '0.25' }} \
+            --stop-pct ${{ github.event.inputs.stop_pct || '0.006' }} \
+            --output-dir results_stocks"
+
+          if [ -n "${{ github.event.inputs.symbols }}" ]; then
+            CMD="$CMD --symbols ${{ github.event.inputs.symbols }}"
+          fi
+
+          echo "Running: $CMD"
+          eval $CMD
 
       - uses: actions/upload-artifact@v4
         with:
