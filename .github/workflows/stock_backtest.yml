@@ -27,11 +27,14 @@ on:
         description: "Stop-loss % (e.g. 0.006 = 0.6%)"
         default: "0.006"
       min_confirm_bars:
-        description: "Consecutive bars above threshold before entry (0 = off)"
+        description: "Consecutive bars above threshold before entry"
+        default: "3"
+      exit_confirm_bars:
+        description: "Consecutive bars below exit_thr before signal_neutral exit"
         default: "3"
       min_hold_bars:
-        description: "Minimum bars to hold before signal-driven exit (0 = off)"
-        default: "5"
+        description: "Minimum bars to hold before any signal-driven exit (15=30 min)"
+        default: "15"
       max_trades_day:
         description: "Max trades per stock per day (reduces overtrading)"
         default: "3"
@@ -44,6 +47,20 @@ on:
           - "false"
       exclude_commodity:
         description: "Exclude commodity/PSU stocks (COALINDIA, ONGC, etc.)?"
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      ic_weights:
+        description: "Use IC-based dynamic factor weights (Fundamental Law)?"
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      adx_filter:
+        description: "Require trending regime (|ADX factor| > threshold) before entry?"
         default: "true"
         type: choice
         options:
@@ -84,13 +101,14 @@ jobs:
 
           # ── Core parameters ────────────────────────────────────────
           CMD="$CMD \
-            --capital          ${{ github.event.inputs.capital || '50000' }} \
-            --entry-thr        ${{ github.event.inputs.entry_threshold || '0.35' }} \
-            --exit-thr         ${{ github.event.inputs.exit_threshold || '0.20' }} \
-            --stop-pct         ${{ github.event.inputs.stop_pct || '0.006' }} \
-            --min-confirm-bars ${{ github.event.inputs.min_confirm_bars || '3' }} \
-            --min-hold-bars    ${{ github.event.inputs.min_hold_bars || '5' }} \
-            --max-trades-day   ${{ github.event.inputs.max_trades_day || '3' }} \
+            --capital           ${{ github.event.inputs.capital || '50000' }} \
+            --entry-thr         ${{ github.event.inputs.entry_threshold || '0.35' }} \
+            --exit-thr          ${{ github.event.inputs.exit_threshold || '0.28' }} \
+            --stop-pct          ${{ github.event.inputs.stop_pct || '0.006' }} \
+            --min-confirm-bars  ${{ github.event.inputs.min_confirm_bars || '3' }} \
+            --exit-confirm-bars ${{ github.event.inputs.exit_confirm_bars || '3' }} \
+            --min-hold-bars     ${{ github.event.inputs.min_hold_bars || '15' }} \
+            --max-trades-day    ${{ github.event.inputs.max_trades_day || '3' }} \
             --output-dir results_stocks"
 
           # ── Optional filters ───────────────────────────────────────
@@ -100,6 +118,14 @@ jobs:
 
           if [ "${{ github.event.inputs.exclude_commodity || 'true' }}" = "false" ]; then
             CMD="$CMD --include-commodity"
+          fi
+
+          if [ "${{ github.event.inputs.ic_weights || 'true' }}" = "false" ]; then
+            CMD="$CMD --no-ic-weights"
+          fi
+
+          if [ "${{ github.event.inputs.adx_filter || 'true' }}" = "false" ]; then
+            CMD="$CMD --no-adx-filter"
           fi
 
           if [ -n "${{ github.event.inputs.symbols }}" ]; then
