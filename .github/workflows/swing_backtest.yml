@@ -21,23 +21,26 @@ on:
         description: "Capital per stock (₹)"
         default: "50000"
       entry_threshold:
-        description: "Entry threshold (0.25 recommended for daily bars)"
-        default: "0.25"
+        description: "Entry threshold (0.30 for daily delivery)"
+        default: "0.30"
       exit_threshold:
         description: "Exit threshold (0.10)"
         default: "0.10"
       stop_pct:
-        description: "Initial stop-loss % (3% for swing)"
-        default: "0.030"
+        description: "Initial stop-loss % (6% for swing — daily gaps)"
+        default: "0.060"
       min_confirm:
         description: "Consecutive days above threshold before entry"
+        default: "3"
+      exit_confirm:
+        description: "Consecutive days below exit threshold before exiting"
         default: "2"
       min_hold:
         description: "Minimum holding days"
-        default: "2"
+        default: "3"
       max_hold:
         description: "Maximum holding days before forced exit"
-        default: "15"
+        default: "20"
       trailing_stop:
         description: "Enable adaptive trailing stop?"
         default: "true"
@@ -54,6 +57,20 @@ on:
           - "false"
       exclude_commodity:
         description: "Exclude commodity/PSU stocks?"
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      allow_short:
+        description: "Allow short trades (F&O only)? Default: long-only delivery"
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      market_filter:
+        description: "Nifty regime filter (only enter longs when Nifty > 20d EMA)?"
         default: "true"
         type: choice
         options:
@@ -86,14 +103,15 @@ jobs:
           mkdir -p results_swing
 
           CMD="python swing_backtest.py \
-            --years   ${{ github.event.inputs.years || '5' }} \
-            --capital ${{ github.event.inputs.capital || '50000' }} \
-            --entry-thr  ${{ github.event.inputs.entry_threshold || '0.25' }} \
-            --exit-thr   ${{ github.event.inputs.exit_threshold  || '0.10' }} \
-            --stop-pct   ${{ github.event.inputs.stop_pct        || '0.030' }} \
-            --min-confirm ${{ github.event.inputs.min_confirm || '2' }} \
-            --min-hold    ${{ github.event.inputs.min_hold    || '2' }} \
-            --max-hold    ${{ github.event.inputs.max_hold    || '15' }} \
+            --years        ${{ github.event.inputs.years || '5' }} \
+            --capital      ${{ github.event.inputs.capital || '50000' }} \
+            --entry-thr    ${{ github.event.inputs.entry_threshold || '0.30' }} \
+            --exit-thr     ${{ github.event.inputs.exit_threshold  || '0.10' }} \
+            --stop-pct     ${{ github.event.inputs.stop_pct        || '0.060' }} \
+            --min-confirm  ${{ github.event.inputs.min_confirm  || '3' }} \
+            --exit-confirm ${{ github.event.inputs.exit_confirm || '2' }} \
+            --min-hold     ${{ github.event.inputs.min_hold     || '3' }} \
+            --max-hold     ${{ github.event.inputs.max_hold     || '20' }} \
             --output-dir results_swing"
 
           if [ "${{ github.event.inputs.trailing_stop || 'true' }}" = "false" ]; then
@@ -106,6 +124,14 @@ jobs:
 
           if [ "${{ github.event.inputs.exclude_commodity || 'true' }}" = "false" ]; then
             CMD="$CMD --include-commodity"
+          fi
+
+          if [ "${{ github.event.inputs.allow_short || 'false' }}" = "true" ]; then
+            CMD="$CMD --allow-short"
+          fi
+
+          if [ "${{ github.event.inputs.market_filter || 'true' }}" = "false" ]; then
+            CMD="$CMD --no-market-filter"
           fi
 
           if [ -n "${{ github.event.inputs.symbols }}" ]; then
