@@ -50,6 +50,7 @@ jobs:
           mkdir -p results
           python multi_factor_nifty_strategy.py \
             --mode backtest \
+            --bar-minutes 2 \
             --days "${{ github.event.inputs.days || '60' }}" \
             --entry-threshold "${{ github.event.inputs.entry_threshold || '0.25' }}" \
             --stop-loss-pct "${{ github.event.inputs.stop_loss_pct || '0.008' }}" \

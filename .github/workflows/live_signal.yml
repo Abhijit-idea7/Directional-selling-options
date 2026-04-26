@@ -1,17 +1,23 @@
-name: Live Signal
+name: Live Signal (2-min bars, 5-min GHA poll)
 
-# Triggers every 5 minutes on weekdays, 09:10 to 15:20 IST
-# IST = UTC+5:30 → market hours in UTC: 03:40–09:50
-# GitHub cron uses UTC.
+# ── Bar interval vs poll interval ──────────────────────────────────────────────
+# Strategy uses 2-minute OHLCV bars for faster, more dynamic signals.
+# GitHub Actions minimum cron granularity is 5 minutes (platform limit).
 #
-# Note: GitHub Actions cron can drift by a few minutes — the adapter handles
-# this gracefully by skipping bars outside market hours.
+# Resolution:
+#   Each workflow run fetches ALL 2-min bars generated since the last run
+#   (typically 2–3 bars). Signals are computed on each bar; the most recent
+#   one drives the order decision. This means signals react to 2-min price
+#   action even though the GHA trigger fires every 5 min.
 #
-# Also triggered manually via workflow_dispatch for testing.
+# For TRUE 2-min execution (signal checked exactly at every bar close):
+#   Run live_trading_adapter.py as a continuous process on a VPS/server.
+#   The adapter's built-in _sleep_to_next_bar(2) handles precise bar timing.
+# ──────────────────────────────────────────────────────────────────────────────
 
 on:
   schedule:
-    # Every 5 min, Mon–Fri, 03:45–09:45 UTC (≈ 09:15–15:15 IST)
+    # Every 5 min, Mon–Fri, 03:45–09:45 UTC (= 09:15–15:15 IST)
     - cron: "45,50,55 3 * * 1-5"
     - cron: "0,5,10,15,20,25,30,35,40,45,50,55 4 * * 1-5"
     - cron: "0,5,10,15,20,25,30,35,40,45,50,55 5 * * 1-5"
@@ -29,7 +35,7 @@ on:
 
 concurrency:
   group: live-signal
-  cancel-in-progress: true   # prevent overlapping runs
+  cancel-in-progress: true   # prevent overlapping runs if GHA drifts
 
 jobs:
   signal:
@@ -38,7 +44,6 @@ jobs:
       - name: Check market hours (IST)
         id: market_check
         run: |
-          # Convert current UTC to IST and verify within 09:15–15:15
           HOUR_IST=$(TZ="Asia/Kolkata" date +%H)
           MIN_IST=$(TZ="Asia/Kolkata" date +%M)
           TIME_INT=$((HOUR_IST * 100 + MIN_IST))
@@ -51,9 +56,7 @@ jobs:
 
       - name: Skip if outside market hours
         if: steps.market_check.outputs.skip == 'true'
-        run: |
-          echo "Outside market hours — skipping."
-          exit 0
+        run: echo "Outside market hours — skipping." && exit 0
 
       - name: Checkout
         if: steps.market_check.outputs.skip != 'true'
@@ -80,7 +83,9 @@ jobs:
           restore-keys: |
             position-state-
 
-      # ── Generate live signal ───────────────────────────────────────────────
+      # ── Generate 2-min bar signal ─────────────────────────────────────────
+      # Fetches last ~5 min of 2-min bars from broker, computes composite
+      # score on each bar, outputs current_signal.json with the latest signal.
       - name: Generate signal
         if: steps.market_check.outputs.skip != 'true'
         env:
@@ -92,9 +97,12 @@ jobs:
           PAPER_TRADE:         ${{ github.event.inputs.paper_trade || 'true' }}
         run: |
           mkdir -p results state
-          python live_trading_adapter.py
+          python multi_factor_nifty_strategy.py \
+            --mode signal \
+            --bar-minutes 2 \
+            --output-dir results
 
-      # ── Execute order (if signal changed) ─────────────────────────────────
+      # ── Execute order if signal changed ───────────────────────────────────
       - name: Execute signal
         if: steps.market_check.outputs.skip != 'true'
         env:
@@ -104,6 +112,7 @@ jobs:
           TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
           PAPER_TRADE:         ${{ github.event.inputs.paper_trade || 'true' }}
+          STRIKE_STEP:         "50"
         run: |
           python signal_executor.py --state-dir state --signal-dir results
 
