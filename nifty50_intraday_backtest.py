@@ -76,6 +76,16 @@ NIFTY50_SYMBOLS = [
     "TECHM",     "TITAN",      "TRENT",      "ULTRACEMCO", "WIPRO",
 ]
 
+# Commodity/PSU stocks that respond poorly to technical momentum signals
+# (news-driven, gap-heavy, low intraday trend persistence)
+EXCLUDE_COMMODITY_PSU = {
+    "COALINDIA", "ONGC", "BPCL", "NTPC", "POWERGRID",
+    "HINDALCO",  "TATASTEEL", "JSWSTEEL", "GRASIM",
+}
+
+# Filtered universe recommended for technical momentum strategies
+NIFTY50_FILTERED = [s for s in NIFTY50_SYMBOLS if s not in EXCLUDE_COMMODITY_PSU]
+
 # yfinance uses .NS suffix for NSE-listed stocks
 def yf_symbol(sym: str) -> str:
     return sym.replace("&", "") + ".NS"   # M&M → MM.NS
@@ -106,13 +116,21 @@ class StockConfig:
     corr_lookback:      int   = 60
 
     # Signal thresholds
-    entry_threshold:    float = 0.25
-    exit_threshold:     float = 0.10
+    entry_threshold:    float = 0.35        # raised vs index (stocks noisier)
+    exit_threshold:     float = 0.20        # wider band → fewer noise exits
+
+    # Signal quality filters (the key fixes from diagnostic)
+    min_confirm_bars:   int   = 3           # score must stay above threshold for N bars
+    min_hold_bars:      int   = 5           # don't exit within first N bars of entry
+    lunch_filter:       bool  = True        # skip 12:00–13:30 (low volume, noisy)
 
     # Risk / sizing
     capital_per_stock:  float = 50_000.0   # ₹ allocated per stock per day
     stop_loss_pct:      float = 0.006       # 0.6% move against position
-    max_trades_per_day: int   = 6           # per stock, to avoid over-trading
+    max_trades_per_day: int   = 3           # reduced from 6 to cut churn
+
+    # Universe filter
+    exclude_commodity:  bool  = True        # drop PSU/commodity stocks
 
     # Transaction costs (per side, as fraction of trade value)
     cost_per_side:      float = 0.0005     # ~0.05% covers brokerage+STT+exchange
@@ -321,7 +339,16 @@ class Trade:
 
 def backtest_single_stock(symbol: str, df: pd.DataFrame,
                            cfg: StockConfig) -> list[Trade]:
-    """Run the full factor-signal backtest on one stock's 2-min data."""
+    """
+    Run the full factor-signal backtest on one stock's bar data.
+
+    Key quality filters applied:
+      min_confirm_bars : score must exceed threshold for N consecutive bars
+                         before entry is allowed (stops whipsaw entries)
+      min_hold_bars    : position cannot be exited in first N bars
+                         (lets the move develop before checking exit)
+      lunch_filter     : skip entries during 12:00-13:30 (thin volume)
+    """
     if df is None or len(df) < 50:
         return []
 
@@ -334,23 +361,30 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
         log.warning(f"{symbol}: factor computation failed — {e}")
         return []
 
-    trades: list[Trade] = []
-    position    = None    # dict or None
-    trades_today = 0
-    last_date   = None
+    trades: list[Trade]  = []
+    position             = None   # dict or None
+    trades_today         = 0
+    last_date            = None
+    confirm_long         = 0      # consecutive bars score >= entry_threshold
+    confirm_short        = 0      # consecutive bars score <= -entry_threshold
+    bars_in_position     = 0      # bars held since entry
 
-    signal_start = pd.to_datetime(cfg.signal_start).time()
-    squareoff    = pd.to_datetime(cfg.squareoff_time).time()
+    signal_start  = pd.to_datetime(cfg.signal_start).time()
+    squareoff     = pd.to_datetime(cfg.squareoff_time).time()
+    lunch_start   = pd.Timestamp("12:00").time()
+    lunch_end     = pd.Timestamp("13:30").time()
 
     for ts, row in signal_df.iterrows():
         t     = ts.time()
         price = row['close']
         score = row.get('composite_score', np.nan)
 
-        # Reset daily trade counter
+        # Reset daily counters at session start
         if ts.date() != last_date:
-            last_date    = ts.date()
-            trades_today = 0
+            last_date     = ts.date()
+            trades_today  = 0
+            confirm_long  = 0
+            confirm_short = 0
 
         # Skip pre-signal bars
         if t < signal_start:
@@ -374,21 +408,46 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                     exit_cost   = cost,
                     exit_reason = 'squareoff',
                 ))
-                position = None
+                position      = None
+                bars_in_position = 0
             continue
 
         if np.isnan(score):
+            confirm_long  = 0
+            confirm_short = 0
             continue
 
-        # ── Determine desired side ────────────────────────────────────────────
+        # ── Update confirmation counters ─────────────────────────────────────
         if score >= cfg.entry_threshold:
-            desired = 'long'
+            confirm_long  += 1
+            confirm_short  = 0
         elif score <= -cfg.entry_threshold:
+            confirm_short += 1
+            confirm_long   = 0
+        else:
+            confirm_long  = 0
+            confirm_short = 0
+
+        # ── Determine desired side (requires N consecutive confirming bars) ───
+        if confirm_long  >= cfg.min_confirm_bars:
+            desired = 'long'
+        elif confirm_short >= cfg.min_confirm_bars:
             desired = 'short'
         else:
             desired = None
 
-        # ── Check stop-loss ───────────────────────────────────────────────────
+        # ── Lunch filter: no new entries, but hold existing positions ─────────
+        in_lunch = cfg.lunch_filter and lunch_start <= t <= lunch_end
+
+        # ── Track bars in position ────────────────────────────────────────────
+        if position is not None:
+            bars_in_position += 1
+            past_min_hold = bars_in_position >= cfg.min_hold_bars
+        else:
+            bars_in_position = 0
+            past_min_hold    = True
+
+        # ── Check stop-loss (always active, even within min-hold period) ──────
         if position is not None:
             sl_hit = False
             if position['side'] == 'long'  and price <= position['sl_price']:
@@ -412,29 +471,38 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                     exit_cost   = cost,
                     exit_reason = 'stop_loss',
                 ))
-                position = None
+                position         = None
+                bars_in_position = 0
+                past_min_hold    = True
 
         # ── Position management ───────────────────────────────────────────────
         if position is None:
-            if desired is not None and trades_today < cfg.max_trades_per_day:
+            # Only enter outside lunch and if budget allows
+            if desired is not None and not in_lunch and \
+               trades_today < cfg.max_trades_per_day:
                 qty  = max(1, int(cfg.capital_per_stock / price))
                 cost = compute_costs(price, qty,
                                      'buy' if desired == 'long' else 'sell', cfg)
                 sl   = (price * (1 - cfg.stop_loss_pct) if desired == 'long'
                         else price * (1 + cfg.stop_loss_pct))
                 position = {
-                    'side':       desired,
-                    'entry_time': ts,
+                    'side':        desired,
+                    'entry_time':  ts,
                     'entry_price': price,
                     'qty':         qty,
                     'entry_cost':  cost,
                     'sl_price':    sl,
                 }
-                trades_today += 1
+                bars_in_position = 0
+                trades_today    += 1
         else:
             cur_side = position['side']
+            # Respect min_hold_bars before any signal-driven exit
+            if not past_min_hold:
+                continue
+
             if desired is not None and desired != cur_side:
-                # Reverse (SAR)
+                # Reverse (SAR) — only outside lunch
                 exit_cost = compute_costs(price, position['qty'],
                                           'sell' if cur_side == 'long' else 'buy',
                                           cfg)
@@ -450,8 +518,10 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                     exit_cost   = exit_cost,
                     exit_reason = 'signal_switch',
                 ))
-                # Open reverse position
-                if trades_today < cfg.max_trades_per_day:
+                position         = None
+                bars_in_position = 0
+                # Open reverse only outside lunch and within budget
+                if not in_lunch and trades_today < cfg.max_trades_per_day:
                     qty  = max(1, int(cfg.capital_per_stock / price))
                     cost = compute_costs(price, qty,
                                          'buy' if desired == 'long' else 'sell', cfg)
@@ -466,11 +536,9 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                         'sl_price':    sl,
                     }
                     trades_today += 1
-                else:
-                    position = None
 
             elif desired is None and abs(score) < cfg.exit_threshold:
-                # Score collapsed → exit to flat
+                # Score collapsed below exit threshold → exit to flat
                 exit_cost = compute_costs(price, position['qty'],
                                           'sell' if cur_side == 'long' else 'buy',
                                           cfg)
@@ -676,22 +744,34 @@ def print_report(stats: dict, top_n: int = 10):
 def _parse():
     p = argparse.ArgumentParser(
         description="Nifty 50 intraday L/S backtest using multi-factor composite score")
-    p.add_argument("--synthetic",    action="store_true",
+    p.add_argument("--synthetic",        action="store_true",
                    help="Use synthetic regime-switching data (default if no source given)")
-    p.add_argument("--days",         type=int,   default=40,
+    p.add_argument("--days",             type=int,   default=40,
                    help="Days of synthetic data per stock")
-    p.add_argument("--data-dir",     type=str,   default=None,
+    p.add_argument("--data-dir",         type=str,   default=None,
                    help="Folder containing <SYMBOL>.csv files (real data)")
-    p.add_argument("--symbols",      type=str,   default=None,
+    p.add_argument("--symbols",          type=str,   default=None,
                    help="Comma-separated subset of symbols (default: all 50)")
-    p.add_argument("--bar-minutes",  type=int,   default=2)
-    p.add_argument("--capital",      type=float, default=50_000,
+    p.add_argument("--bar-minutes",      type=int,   default=2)
+    p.add_argument("--capital",          type=float, default=50_000,
                    help="₹ capital per stock per day")
-    p.add_argument("--entry-thr",    type=float, default=0.25)
-    p.add_argument("--exit-thr",     type=float, default=0.10)
-    p.add_argument("--stop-pct",     type=float, default=0.006)
-    p.add_argument("--output-dir",   type=str,   default="results_stocks")
-    p.add_argument("--workers",      type=int,   default=8,
+    p.add_argument("--entry-thr",        type=float, default=0.35,
+                   help="Entry threshold (0.35 default — raised vs index)")
+    p.add_argument("--exit-thr",         type=float, default=0.20,
+                   help="Exit threshold (0.20 default — wider hysteresis band)")
+    p.add_argument("--stop-pct",         type=float, default=0.006)
+    p.add_argument("--min-confirm-bars", type=int,   default=3,
+                   help="Consecutive bars score must exceed threshold before entry")
+    p.add_argument("--min-hold-bars",    type=int,   default=5,
+                   help="Minimum bars to hold before signal-driven exit")
+    p.add_argument("--max-trades-day",   type=int,   default=3,
+                   help="Maximum trades per stock per day")
+    p.add_argument("--no-lunch-filter",  action="store_true",
+                   help="Disable the 12:00–13:30 lunch-hour entry filter")
+    p.add_argument("--include-commodity", action="store_true",
+                   help="Include commodity/PSU stocks (excluded by default)")
+    p.add_argument("--output-dir",       type=str,   default="results_stocks")
+    p.add_argument("--workers",          type=int,   default=8,
                    help="Parallel workers for per-stock factor computation")
     return p.parse_args()
 
@@ -701,15 +781,26 @@ if __name__ == "__main__":
     os.makedirs(args.output_dir, exist_ok=True)
 
     cfg = StockConfig(
-        bar_minutes       = args.bar_minutes,
-        capital_per_stock = args.capital,
-        entry_threshold   = args.entry_thr,
-        exit_threshold    = args.exit_thr,
-        stop_loss_pct     = args.stop_pct,
+        bar_minutes        = args.bar_minutes,
+        capital_per_stock  = args.capital,
+        entry_threshold    = args.entry_thr,
+        exit_threshold     = args.exit_thr,
+        stop_loss_pct      = args.stop_pct,
+        min_confirm_bars   = args.min_confirm_bars,
+        min_hold_bars      = args.min_hold_bars,
+        max_trades_per_day = args.max_trades_day,
+        lunch_filter       = not args.no_lunch_filter,
+        exclude_commodity  = not args.include_commodity,
     )
 
-    symbols = (args.symbols.split(",") if args.symbols
-               else NIFTY50_SYMBOLS)
+    if args.symbols:
+        symbols = args.symbols.split(",")
+    elif cfg.exclude_commodity:
+        symbols = NIFTY50_FILTERED          # drop PSU/commodity stocks
+        log.info(f"Universe: {len(symbols)} stocks "
+                 f"(commodity/PSU excluded — use --include-commodity to override)")
+    else:
+        symbols = NIFTY50_SYMBOLS
 
     # ── Load data ──────────────────────────────────────────────────────────
     stock_data: dict[str, pd.DataFrame] = {}
