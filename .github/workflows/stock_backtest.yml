@@ -27,14 +27,14 @@ on:
         description: "Stop-loss % (e.g. 0.006 = 0.6%)"
         default: "0.006"
       min_confirm_bars:
-        description: "Consecutive bars above threshold before entry"
-        default: "3"
+        description: "Consecutive bars above threshold before entry (default=5)"
+        default: "5"
       exit_confirm_bars:
         description: "Consecutive bars below exit_thr before signal_neutral exit"
         default: "3"
       min_hold_bars:
-        description: "Minimum bars to hold before any signal-driven exit (15=30 min)"
-        default: "15"
+        description: "Minimum bars to hold before signal-driven exit (default=8=16 min)"
+        default: "8"
       max_trades_day:
         description: "Max trades per stock per day (reduces overtrading)"
         default: "3"
@@ -66,6 +66,13 @@ on:
         options:
           - "true"
           - "false"
+      sar_mode:
+        description: "SAR: immediately reverse on signal flip (true) or wait for fresh confirmation (false)?"
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
       symbols:
         description: "Comma-separated symbols to test (blank = all filtered)"
         default: ""
@@ -104,10 +111,11 @@ jobs:
             --capital           ${{ github.event.inputs.capital || '50000' }} \
             --entry-thr         ${{ github.event.inputs.entry_threshold || '0.35' }} \
             --exit-thr          ${{ github.event.inputs.exit_threshold || '0.28' }} \
-            --stop-pct          ${{ github.event.inputs.stop_pct || '0.006' }} \
-            --min-confirm-bars  ${{ github.event.inputs.min_confirm_bars || '3' }} \
+            --stop-pct          ${{ github.event.inputs.stop_pct || '0.008' }} \
+            --min-confirm-bars  ${{ github.event.inputs.min_confirm_bars || '5' }} \
             --exit-confirm-bars ${{ github.event.inputs.exit_confirm_bars || '3' }} \
-            --min-hold-bars     ${{ github.event.inputs.min_hold_bars || '15' }} \
+            --min-hold-bars     ${{ github.event.inputs.min_hold_bars || '8' }} \
+            --adx-trend-min     0.25 \
             --max-trades-day    ${{ github.event.inputs.max_trades_day || '3' }} \
             --output-dir results_stocks"
 
@@ -126,6 +134,10 @@ jobs:
 
           if [ "${{ github.event.inputs.adx_filter || 'true' }}" = "false" ]; then
             CMD="$CMD --no-adx-filter"
+          fi
+
+          if [ "${{ github.event.inputs.sar_mode || 'false' }}" = "true" ]; then
+            CMD="$CMD --sar"
           fi
 
           if [ -n "${{ github.event.inputs.symbols }}" ]; then
