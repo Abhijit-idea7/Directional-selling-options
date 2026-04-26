@@ -72,14 +72,19 @@ class SwingConfig:
     or_minutes:         int   = 15       # not meaningful on daily — F9 gets low IC weight
     corr_lookback:      int   = 60       # 60 trading days ≈ 3 months
 
+    # ── Direction ──────────────────────────────────────────────────────────
+    # Equity delivery trades in India are LONG-ONLY (no short-selling in cash
+    # market). Short signals are ignored; signal reversals exit to flat only.
+    # Set long_only=False only when trading via F&O (futures/options).
+    long_only:          bool  = True
+
     # ── Signal thresholds ──────────────────────────────────────────────────
-    # Daily bars are cleaner so thresholds can be looser than intraday
-    entry_threshold:    float = 0.25
+    entry_threshold:    float = 0.30     # raised vs original — daily needs conviction
     exit_threshold:     float = 0.10
 
     # ── Entry quality ──────────────────────────────────────────────────────
-    min_confirm_days:   int   = 2        # consecutive days above threshold before entry
-    exit_confirm_days:  int   = 2        # consecutive days below exit_threshold before exit
+    min_confirm_days:   int   = 3        # 3 consecutive days above threshold → entry
+    exit_confirm_days:  int   = 2        # 2 consecutive days below exit_threshold → exit
 
     # ── IC-based dynamic factor weighting (Fundamental Law) ───────────────
     use_ic_weights:     bool  = True
@@ -87,20 +92,30 @@ class SwingConfig:
     ic_min_obs:         int   = 20
 
     # ── Holding period ─────────────────────────────────────────────────────
-    min_hold_days:      int   = 2        # never exit within 2 days of entry
-    max_hold_days:      int   = 15       # force exit after 15 trading days (~3 weeks)
+    min_hold_days:      int   = 3        # minimum 3 days (avoid noise exits)
+    max_hold_days:      int   = 20       # let winners run up to 4 weeks
 
     # ── Stop loss management ───────────────────────────────────────────────
-    # Checked against daily LOW (long) or HIGH (short) for intraday stop fills.
-    stop_loss_pct:      float = 0.030    # 3% initial stop — wider for multi-day holds
+    # Daily stocks can gap 2-3% on news; 3% stop was being hit on 83% of trades.
+    # Widened to 6% — the trailing mechanism tightens it after the trade moves.
+    stop_loss_pct:      float = 0.060    # 6% initial stop for positional holds
     trailing_stop:      bool  = True
-    trail_trigger_pct:  float = 0.015    # 1.5% gain → start trailing
-    trail_pct:          float = 0.020    # trail at 2% below peak
-    breakeven_trigger:  float = 0.008    # 0.8% gain → move stop to entry (breakeven)
+    trail_trigger_pct:  float = 0.020    # 2% gain  → start trailing
+    trail_pct:          float = 0.030    # trail at 3% below peak (locks in profit)
+    breakeven_trigger:  float = 0.010    # 1% gain  → move stop to entry (zero loss)
+
+    # ── Market regime filter (Nifty macro trend) ───────────────────────────
+    # Only enter new LONG positions when Nifty 50 index is in an uptrend.
+    # This prevents buying individual stocks during market-wide corrections.
+    # Regime: bullish when Nifty close > nifty_ema_period-day EMA.
+    # May/Jun 2025 drawdown (-₹98k in 2 months) was from entering longs into
+    # a broad correction — this filter prevents that regime.
+    market_filter:      bool  = True
+    nifty_ema_period:   int   = 20       # 20-day EMA of Nifty 50 index
 
     # ── Position sizing ────────────────────────────────────────────────────
     capital_per_stock:  float = 50_000.0
-    max_concurrent:     int   = 10       # cap simultaneous open positions
+    max_concurrent:     int   = 10       # max simultaneous open positions
 
     # ── Universe ───────────────────────────────────────────────────────────
     exclude_commodity:  bool  = True
@@ -185,52 +200,82 @@ def compute_costs(price: float, qty: int, side: str) -> float:
     return brokerage + stt + exchange + sebi + stamp + gst
 
 
-# ─── Data Fetcher ─────────────────────────────────────────────────────────────
+# ─── Data Fetchers ────────────────────────────────────────────────────────────
 
-def fetch_daily_stock(symbol: str, years: int = 5) -> Optional[pd.DataFrame]:
-    """
-    Fetch daily OHLCV from yfinance (up to `years` of history).
-    Returns None if fewer than 100 bars available.
-    """
+def _yf_download(ticker: str, years: int, min_bars: int = 100) -> Optional[pd.DataFrame]:
+    """Shared yfinance download helper."""
     try:
         import yfinance as yf
         end   = pd.Timestamp.now().normalize()
         start = end - pd.Timedelta(days=int(years * 365.25))
-        raw   = yf.download(
-            yf_symbol(symbol),
-            start=start.strftime("%Y-%m-%d"),
-            end=end.strftime("%Y-%m-%d"),
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-        )
-        if raw.empty or len(raw) < 100:
+        raw   = yf.download(ticker, start=start.strftime("%Y-%m-%d"),
+                             end=end.strftime("%Y-%m-%d"),
+                             interval="1d", auto_adjust=True, progress=False)
+        if raw.empty or len(raw) < min_bars:
             return None
-        # Flatten multi-level columns if present
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = [c[0].lower() for c in raw.columns]
         else:
             raw.columns = [c.lower() for c in raw.columns]
         df = raw[['open', 'high', 'low', 'close', 'volume']].copy()
         df.index = pd.to_datetime(df.index)
-        df = df.dropna()
-        return df
+        return df.dropna()
     except Exception as e:
-        log.warning(f"  {symbol}: fetch failed — {e}")
+        log.warning(f"  {ticker}: fetch failed — {e}")
         return None
+
+
+def fetch_daily_stock(symbol: str, years: int = 5) -> Optional[pd.DataFrame]:
+    """Fetch daily OHLCV for a Nifty 50 stock (returns None if < 100 bars)."""
+    return _yf_download(yf_symbol(symbol), years)
+
+
+def fetch_nifty_index(years: int = 5) -> Optional[pd.Series]:
+    """
+    Fetch daily Nifty 50 index closing prices (^NSEI).
+    Used to build the market regime filter.
+    Returns a Series indexed by date, or None on failure.
+    """
+    df = _yf_download("^NSEI", years, min_bars=50)
+    if df is None:
+        return None
+    return df['close'].rename("nifty_close")
+
+
+def build_nifty_regime(nifty_close: pd.Series, ema_period: int = 20) -> pd.Series:
+    """
+    Returns a boolean Series: True when Nifty is in a bullish regime.
+    Bullish = Nifty close > ema_period-day EMA of Nifty.
+    We use yesterday's value (shift(1)) so there is no look-ahead at signal time.
+    """
+    ema      = nifty_close.ewm(span=ema_period, adjust=False).mean()
+    bullish  = (nifty_close > ema).shift(1).fillna(False)   # no look-ahead
+    return bullish.astype(bool)
 
 
 # ─── Single-Stock Swing Backtest ──────────────────────────────────────────────
 
 def backtest_swing_stock(symbol: str, df: pd.DataFrame,
-                         cfg: SwingConfig) -> list[SwingTrade]:
+                         cfg: SwingConfig,
+                         nifty_regime: Optional[pd.Series] = None) -> list[SwingTrade]:
     """
     Run the swing backtest on one stock's daily data.
 
     Execution model (no look-ahead):
       Day N close  →  compute signal
       Day N+1 open →  enter / exit (execution price)
-      Stop loss    →  checked against Day N+1 low/high (intraday fill)
+      Stop loss    →  checked against Day N+1 intraday LOW/HIGH (realistic fill)
+
+    long_only=True  (default):
+      - Short signals are ignored entirely
+      - signal_switch exits the long to flat; does NOT open a short
+      - Only long trades are recorded
+
+    market_filter=True  (default):
+      - New LONG entries only allowed when Nifty is in a bullish regime
+        (Nifty close > 20-day EMA, evaluated on previous day — no look-ahead)
+      - Existing positions are NOT force-exited on regime change
+        (avoids unnecessary stop-outs during brief corrections)
     """
     if df is None or len(df) < 60:
         return []
@@ -242,6 +287,18 @@ def backtest_swing_stock(symbol: str, df: pd.DataFrame,
     except Exception as e:
         log.warning(f"{symbol}: factor computation failed — {e}")
         return []
+
+    # ── Align Nifty market regime to this stock's trading calendar ────────────
+    # build_nifty_regime already applies shift(1), so regime_aligned.iloc[i]
+    # at execution bar i reflects Nifty's state as of bar i-1 (yesterday) — no
+    # look-ahead when deciding whether to enter today.
+    if nifty_regime is not None and cfg.market_filter:
+        regime_aligned = (nifty_regime
+                          .reindex(signal_df.index, method='ffill')
+                          .fillna(False)
+                          .astype(bool))
+    else:
+        regime_aligned = pd.Series(True, index=signal_df.index)
 
     trades: list[SwingTrade] = []
     position                 = None
@@ -261,6 +318,11 @@ def backtest_swing_stock(symbol: str, df: pd.DataFrame,
         today_high  = float(curr['high'])
         today_low   = float(curr['low'])
         today_close = float(curr['close'])
+
+        # ── Market regime at execution time ────────────────────────────────
+        # regime_aligned has shift(1) baked in, so .iloc[i] = yesterday's regime
+        in_bull_regime = bool(regime_aligned.iloc[i])
+        can_long = (not cfg.market_filter) or in_bull_regime
 
         if np.isnan(score):
             confirm_long = confirm_short = 0
@@ -374,9 +436,14 @@ def backtest_swing_stock(symbol: str, df: pd.DataFrame,
 
         # ── Position management at today's OPEN ─────────────────────────────
         if position is None:
-            if desired is not None:
-                qty  = max(1, int(cfg.capital_per_stock / exec_price))
+            # Long-only: ignore short signals; market filter: skip longs in
+            # bear regime (new entries only — existing positions never force-exited).
+            can_enter_long  = (desired == 'long'  and can_long)
+            can_enter_short = (desired == 'short' and not cfg.long_only)
+
+            if can_enter_long or can_enter_short:
                 side = desired
+                qty  = max(1, int(cfg.capital_per_stock / exec_price))
                 cost = compute_costs(exec_price, qty,
                                      'buy' if side == 'long' else 'sell')
                 sl   = (exec_price * (1 - cfg.stop_loss_pct) if side == 'long'
@@ -474,14 +541,32 @@ class PortfolioSwingBacktest:
         self.cfg = cfg
 
     def run(self, stock_data: dict[str, pd.DataFrame],
+             years: int = 5,
              max_workers: int = 8) -> pd.DataFrame:
         all_trades = []
         symbols    = list(stock_data.keys())
         log.info(f"Running swing backtest on {len(symbols)} stocks …")
 
+        # ── Fetch Nifty 50 index for market regime filter ───────────────────
+        nifty_regime = None
+        if self.cfg.market_filter:
+            log.info("Fetching Nifty 50 index for market regime filter …")
+            nifty_close = fetch_nifty_index(years=years)
+            if nifty_close is not None:
+                nifty_regime = build_nifty_regime(nifty_close,
+                                                  self.cfg.nifty_ema_period)
+                bull_days  = int(nifty_regime.sum())
+                total_days = len(nifty_regime)
+                log.info(f"  Nifty regime: {total_days} days, "
+                         f"bullish={bull_days} ({bull_days/total_days*100:.0f}%)")
+            else:
+                log.warning("  Could not fetch Nifty index — "
+                            "market filter disabled for this run")
+
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {
-                ex.submit(backtest_swing_stock, sym, stock_data[sym], self.cfg): sym
+                ex.submit(backtest_swing_stock, sym, stock_data[sym],
+                          self.cfg, nifty_regime): sym
                 for sym in symbols
             }
             done = 0
@@ -671,33 +756,40 @@ def print_report(stats: dict, top_n: int = 10):
 
 def _parse():
     p = argparse.ArgumentParser(
-        description="Nifty 50 swing/positional backtest — daily bars, 5-year history")
-    p.add_argument("--years",            type=int,   default=5,
+        description="Nifty 50 swing/positional backtest — daily bars, long-only delivery")
+    p.add_argument("--years",             type=int,   default=5,
                    help="Years of daily history to fetch via yfinance (default=5)")
-    p.add_argument("--symbols",          type=str,   default=None,
+    p.add_argument("--symbols",           type=str,   default=None,
                    help="Comma-separated subset of symbols (default: all filtered)")
-    p.add_argument("--capital",          type=float, default=50_000,
+    p.add_argument("--capital",           type=float, default=50_000,
                    help="₹ capital per stock (default=50000)")
-    p.add_argument("--entry-thr",        type=float, default=0.25,
-                   help="Entry threshold (daily bars are cleaner, 0.25 works well)")
-    p.add_argument("--exit-thr",         type=float, default=0.10)
-    p.add_argument("--stop-pct",         type=float, default=0.030,
-                   help="Initial stop-loss %% (default=3%% for swing)")
-    p.add_argument("--min-confirm",      type=int,   default=2,
-                   help="Consecutive days above threshold before entry (default=2)")
-    p.add_argument("--min-hold",         type=int,   default=2,
-                   help="Minimum holding days (default=2)")
-    p.add_argument("--max-hold",         type=int,   default=15,
-                   help="Maximum holding days before forced exit (default=15)")
-    p.add_argument("--no-trailing-stop", action="store_true",
+    p.add_argument("--entry-thr",         type=float, default=0.30,
+                   help="Entry threshold (default=0.30 for daily bars)")
+    p.add_argument("--exit-thr",          type=float, default=0.10,
+                   help="Exit threshold (default=0.10)")
+    p.add_argument("--stop-pct",          type=float, default=0.060,
+                   help="Initial stop-loss %% (default=6%% — widened for daily volatility)")
+    p.add_argument("--min-confirm",       type=int,   default=3,
+                   help="Consecutive days above threshold before entry (default=3)")
+    p.add_argument("--exit-confirm",      type=int,   default=2,
+                   help="Consecutive days below exit_thr before signal_neutral exit (default=2)")
+    p.add_argument("--min-hold",          type=int,   default=3,
+                   help="Minimum holding days (default=3)")
+    p.add_argument("--max-hold",          type=int,   default=20,
+                   help="Maximum holding days before forced exit (default=20)")
+    p.add_argument("--no-trailing-stop",  action="store_true",
                    help="Disable adaptive trailing stop")
-    p.add_argument("--no-ic-weights",    action="store_true",
+    p.add_argument("--no-ic-weights",     action="store_true",
                    help="Disable IC-based factor weights")
     p.add_argument("--include-commodity", action="store_true",
                    help="Include commodity/PSU stocks (excluded by default)")
-    p.add_argument("--output-dir",       type=str,   default="results_swing",
+    p.add_argument("--allow-short",       action="store_true",
+                   help="Allow short trades (F&O only; default=long-only for delivery)")
+    p.add_argument("--no-market-filter",  action="store_true",
+                   help="Disable Nifty market regime filter (not recommended)")
+    p.add_argument("--output-dir",        type=str,   default="results_swing",
                    help="Output directory for CSV/JSON results")
-    p.add_argument("--workers",          type=int,   default=8)
+    p.add_argument("--workers",           type=int,   default=8)
     return p.parse_args()
 
 
@@ -706,23 +798,28 @@ if __name__ == "__main__":
     os.makedirs(args.output_dir, exist_ok=True)
 
     cfg = SwingConfig(
-        capital_per_stock = args.capital,
-        entry_threshold   = args.entry_thr,
-        exit_threshold    = args.exit_thr,
-        stop_loss_pct     = args.stop_pct,
-        min_confirm_days  = args.min_confirm,
-        min_hold_days     = args.min_hold,
-        max_hold_days     = args.max_hold,
-        trailing_stop     = not args.no_trailing_stop,
-        use_ic_weights    = not args.no_ic_weights,
-        exclude_commodity = not args.include_commodity,
+        capital_per_stock  = args.capital,
+        entry_threshold    = args.entry_thr,
+        exit_threshold     = args.exit_thr,
+        stop_loss_pct      = args.stop_pct,
+        min_confirm_days   = args.min_confirm,
+        exit_confirm_days  = args.exit_confirm,
+        min_hold_days      = args.min_hold,
+        max_hold_days      = args.max_hold,
+        trailing_stop      = not args.no_trailing_stop,
+        use_ic_weights     = not args.no_ic_weights,
+        exclude_commodity  = not args.include_commodity,
+        long_only          = not args.allow_short,
+        market_filter      = not args.no_market_filter,
     )
 
     log.info("SwingConfig: entry_thr=%.2f  exit_thr=%.2f  stop=%.1f%%  "
-             "min_confirm=%d  hold=%d–%d days  IC=%s  trailing=%s",
+             "min_confirm=%d  hold=%d–%d days  IC=%s  trailing=%s  "
+             "long_only=%s  market_filter=%s",
              cfg.entry_threshold, cfg.exit_threshold, cfg.stop_loss_pct * 100,
              cfg.min_confirm_days, cfg.min_hold_days, cfg.max_hold_days,
-             cfg.use_ic_weights, cfg.trailing_stop)
+             cfg.use_ic_weights, cfg.trailing_stop,
+             cfg.long_only, cfg.market_filter)
 
     symbols = (args.symbols.split(",") if args.symbols
                else (NIFTY50_FILTERED if cfg.exclude_commodity else NIFTY50_SYMBOLS))
@@ -748,7 +845,7 @@ if __name__ == "__main__":
 
     # ── Run backtest ───────────────────────────────────────────────────────
     bt     = PortfolioSwingBacktest(cfg)
-    trades = bt.run(stock_data, max_workers=args.workers)
+    trades = bt.run(stock_data, years=args.years, max_workers=args.workers)
 
     stats  = analyse(trades, cfg)
     print_report(stats)
