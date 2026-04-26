@@ -49,7 +49,8 @@ class StrategyConfig:
     market_open:        str   = "09:15"
     market_close:       str   = "15:30"
     squareoff_time:     str   = "15:15"
-    signal_start:       str   = "09:45"   # wait for opening range to form
+    signal_start:       str   = "09:30"   # first bar evaluated after 15-min OR forms
+    bar_minutes:        int   = 2         # candle interval in minutes
 
     # Factor parameters
     ema_fast:           int   = 9
@@ -62,7 +63,7 @@ class StrategyConfig:
     supertrend_factor:  float = 3.0
     roc_period:         int   = 5
     vol_avg_period:     int   = 20
-    or_minutes:         int   = 30         # opening range duration
+    or_minutes:         int   = 15         # opening range duration (09:15–09:30, 7 × 2-min candles)
 
     # Signal thresholds
     entry_threshold:    float = 0.25       # |score| > this to enter/switch
@@ -253,32 +254,33 @@ class FactorEngine:
 
     # F9 – Opening Range Breakout ----------------------------------------------
     def _f9_opening_range(self, df: pd.DataFrame) -> pd.DataFrame:
-        df['_date'] = df.index.date
         h, m = map(int, self.cfg.market_open.split(":"))
-        or_end_time = pd.Timedelta(hours=h, minutes=m + self.cfg.or_minutes)
+        or_end_offset = pd.Timedelta(hours=h, minutes=m + self.cfg.or_minutes)
 
-        def _or_for_day(g):
-            g = g.copy()
-            cutoff = g.index[0].normalize() + or_end_time
-            or_bars = g[g.index <= cutoff]
-            if or_bars.empty:
-                g['_or_high'] = np.nan
-                g['_or_low']  = np.nan
-            else:
-                g['_or_high'] = or_bars['high'].max()
-                g['_or_low']  = or_bars['low'].min()
-            return g
+        # Compute per-day OR high/low using vectorised index operations,
+        # avoiding groupby so pandas 2.x column-dropping behaviour is not an issue.
+        day_starts = df.index.normalize()           # midnight timestamp per bar
+        or_cutoffs = day_starts + or_end_offset     # OR end timestamp per bar
 
-        df = df.groupby('_date', group_keys=False).apply(_or_for_day)
+        in_or      = df.index < or_cutoffs          # strictly less-than: bars that COMPLETE before OR end
+        or_high    = pd.Series(np.nan, index=df.index)
+        or_low     = pd.Series(np.nan, index=df.index)
 
-        or_mid   = (df['_or_high'] + df['_or_low']) / 2
-        or_range = (df['_or_high'] - df['_or_low']).replace(0, np.nan)
+        for day in day_starts.unique():
+            day_mask   = day_starts == day
+            or_mask    = day_mask & in_or
+            if not or_mask.any():
+                continue
+            day_or_high = df.loc[or_mask, 'high'].max()
+            day_or_low  = df.loc[or_mask, 'low'].min()
+            or_high[day_mask] = day_or_high
+            or_low[day_mask]  = day_or_low
 
-        # Score = how far price has broken above/below OR midpoint, normalised by OR range
-        score = (df['close'] - or_mid) / or_range
+        or_mid   = (or_high + or_low) / 2
+        or_range = (or_high - or_low).replace(0, np.nan)
+
+        score    = (df['close'] - or_mid) / or_range
         df['f9'] = score.clip(-1, 1)
-
-        df.drop(columns=['_date', '_or_high', '_or_low'], inplace=True)
         return df
 
     # F10 – Candle Strength ----------------------------------------------------
@@ -647,14 +649,15 @@ class BacktestAnalytics:
 
 # ─── Data Generator (for testing without live data) ───────────────────────────
 
-def generate_synthetic_nifty(days: int = 20, seed: int = 42) -> pd.DataFrame:
+def generate_synthetic_nifty(days: int = 20, seed: int = 42,
+                              bar_minutes: int = 2) -> pd.DataFrame:
     """
-    Generate synthetic 5-minute Nifty-like OHLCV data for strategy testing.
+    Generate synthetic Nifty-like OHLCV data for strategy testing.
+    Default: 2-minute bars.  375 min session / 2 = 187 bars per day.
     Replace with actual data from broker API, NSE, or data vendor in production.
     """
     rng   = np.random.default_rng(seed)
-    bars_per_day = 75     # 09:15 to 15:30 = 375 min / 5 = 75 bars
-    total = days * bars_per_day
+    bars_per_day = 375 // bar_minutes   # 187 for 2-min, 75 for 5-min
 
     dates = []
     for d in range(days):
@@ -662,7 +665,7 @@ def generate_synthetic_nifty(days: int = 20, seed: int = 42) -> pd.DataFrame:
         if start.weekday() >= 5:
             continue
         for b in range(bars_per_day):
-            dates.append(start + pd.Timedelta(minutes=b * 5 + 9 * 60 + 15))
+            dates.append(start + pd.Timedelta(minutes=b * bar_minutes + 9 * 60 + 15))
 
     n = len(dates)
     spot = 22000.0
@@ -704,6 +707,7 @@ def _parse_args():
     p.add_argument("--stop-loss-pct",    type=float, default=0.008)
     p.add_argument("--premium-sl-mult",  type=float, default=2.0)
     p.add_argument("--signal-bars",      type=int,   default=1,       help="Bars of history for --mode signal")
+    p.add_argument("--bar-minutes",      type=int,   default=2,       help="Candle interval in minutes (default 2)")
     return p.parse_args()
 
 
@@ -718,6 +722,7 @@ if __name__ == "__main__":
         exit_threshold  = args.exit_threshold,
         stop_loss_pct   = args.stop_loss_pct,
         premium_sl_mult = args.premium_sl_mult,
+        bar_minutes     = args.bar_minutes,
     )
 
     # ── Load data ──────────────────────────────────────────────────────────────
@@ -730,8 +735,10 @@ if __name__ == "__main__":
             raise ValueError(f"CSV missing columns: {missing}")
         print(f"Loaded {len(df)} bars from {args.data_csv}")
     else:
-        print(f"No --data-csv provided. Generating {args.days} days of synthetic data...")
-        df = generate_synthetic_nifty(days=args.days, seed=args.seed)
+        print(f"No --data-csv provided. Generating {args.days} days of synthetic "
+              f"{args.bar_minutes}-min bar data...")
+        df = generate_synthetic_nifty(days=args.days, seed=args.seed,
+                                      bar_minutes=args.bar_minutes)
 
     # ── Mode: signal (compute current signal from most recent bars) ────────────
     if args.mode == "signal":

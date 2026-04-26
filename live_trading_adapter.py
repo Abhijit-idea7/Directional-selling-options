@@ -228,14 +228,43 @@ class BrokerAPI:
         return "UNKNOWN"
 
 
-# ─── ATM Strike Helper ────────────────────────────────────────────────────────
+# ─── ATM Strike Selection (fully dynamic) ────────────────────────────────────
+#
+# How strikes are chosen — answered explicitly:
+#
+#   YES — the bot picks the ATM strike dynamically at the moment of every
+#   trade entry or switch.  It does NOT hold a fixed strike across the day.
+#
+#   Mechanism (runs on each new position open / SAR switch):
+#     1. Fetch current Nifty spot (live LTP from broker API)
+#     2. Round to nearest 50 → ATM strike
+#        e.g. spot = 22,387  →  strike = 22,400
+#             spot = 22,150  →  strike = 22,150
+#     3. Find nearest Thursday weekly expiry
+#     4. Build option symbol  e.g. "NIFTY25JUN22400CE"
+#     5. Place SELL MARKET order for that symbol
+#
+#   On a SAR switch (short_put → short_call or vice versa):
+#     - The old option is BOUGHT back at market (exit)
+#     - The new ATM strike is recalculated from the CURRENT spot at that moment
+#     - So if Nifty moved 100 pts between entry and switch, the new strike
+#       will be 100 pts away from the original — always fresh ATM.
+#
+#   Strike step (50 pts for Nifty) is configurable via STRIKE_STEP env var.
 
-def get_atm_strike(spot: float, step: int = 50) -> int:
+STRIKE_STEP = int(os.getenv("STRIKE_STEP", "50"))
+
+
+def get_atm_strike(spot: float, step: int = STRIKE_STEP) -> int:
+    """Round spot to nearest strike step to find the ATM strike."""
     return int(round(spot / step) * step)
 
 
 def get_nearest_expiry() -> date:
-    """Return nearest Thursday (Nifty weekly expiry)."""
+    """
+    Return nearest upcoming Thursday (Nifty weekly expiry).
+    If today IS Thursday, returns NEXT Thursday (avoids same-day expiry risk).
+    """
     today = date.today()
     days_to_thursday = (3 - today.weekday()) % 7
     expiry = today + timedelta(days=days_to_thursday)
@@ -257,7 +286,8 @@ class LiveSignalEngine:
     on each new bar close. Issues position directives in real time.
     """
 
-    def __init__(self, cfg: StrategyConfig, warmup_bars: int = 80):
+    def __init__(self, cfg: StrategyConfig, warmup_bars: int = 50):
+        # 50 × 2-min bars = 100 min of history, enough for all indicators to stabilise
         self.cfg         = cfg
         self.factors     = FactorEngine(cfg)
         self.pricer      = OptionPricer(cfg)
@@ -303,10 +333,18 @@ class LiveSignalEngine:
 class LiveSession:
     """
     Orchestrates the intraday session:
-      1. Load morning historical bars for warmup
-      2. Poll for new bars every 5 minutes at bar close
-      3. Execute position switches via broker API
-      4. Mandatory square-off at 15:15
+      1. Load today's 2-min historical bars for indicator warmup
+      2. Poll for new 2-min bar close every 2 minutes
+      3. Recompute composite score from all 10 factors
+      4. Enter / switch / exit naked option position via broker API
+      5. Mandatory square-off at 15:15 IST
+
+    NOTE on GitHub Actions scheduling:
+      GHA minimum cron interval is 5 minutes. When running via GHA, the
+      workflow fires every 5 min and signal_executor.py processes ALL 2-min
+      bars generated since the last run (~2-3 bars). The signal from the
+      most recent bar drives the order decision. For true 2-min execution,
+      run live_trading_adapter.py as a continuous process on a server/VPS.
     """
 
     def __init__(self, cfg: StrategyConfig = None, paper_trade: bool = True):
@@ -339,27 +377,29 @@ class LiveSession:
                 log.info("Session complete.")
                 break
 
-            # Wait for next 5-min bar close
-            self._sleep_to_next_bar()
+            # Wait for next 2-min bar close
+            self._sleep_to_next_bar(bar_minutes=self.cfg.bar_minutes)
             self._on_bar_close()
 
     def _warmup(self):
-        """Load today's historical bars up to now for factor warmup."""
-        log.info("Loading historical bars for warmup...")
-        today_start = datetime.now(IST).replace(hour=9, minute=15, second=0)
+        """Load today's 2-min historical bars up to now for factor warmup."""
+        log.info("Loading 2-min historical bars for warmup...")
+        today_start = datetime.now(IST).replace(hour=9, minute=15, second=0,
+                                                microsecond=0)
         now         = datetime.now(IST)
+        interval    = f"{self.cfg.bar_minutes}minute"   # "2minute"
         try:
             hist = self.broker.get_historical_candles(
-                "NSE:NIFTY 50", "5minute", today_start, now)
+                "NSE:NIFTY 50", interval, today_start, now)
             for ts, row in hist.iterrows():
                 self.engine.ingest_bar(ts, row['open'], row['high'],
                                        row['low'], row['close'], row['volume'])
-            log.info(f"Warmup complete: {len(hist)} bars loaded")
+            log.info(f"Warmup complete: {len(hist)} × {self.cfg.bar_minutes}-min bars loaded")
         except NotImplementedError:
             log.warning("Broker API not connected — running in simulation mode")
 
     def _on_bar_close(self):
-        """Called at close of each 5-min bar."""
+        """Called at close of each 2-min bar."""
         now = datetime.now(IST)
         log.info(f"── Bar close: {now.strftime('%H:%M')} ──────────────────────────")
 
@@ -465,11 +505,11 @@ class LiveSession:
         return (side == 'short_call' and spot >= sl_spot) or \
                (side == 'short_put'  and spot <= sl_spot)
 
-    def _sleep_to_next_bar(self, bar_minutes: int = 5):
+    def _sleep_to_next_bar(self, bar_minutes: int = 2):
         now     = datetime.now(IST)
-        elapsed = now.minute % bar_minutes * 60 + now.second
-        wait    = bar_minutes * 60 - elapsed + 2   # 2-second buffer after bar close
-        log.info(f"  Sleeping {wait}s until next bar close...")
+        elapsed = (now.minute % bar_minutes) * 60 + now.second
+        wait    = bar_minutes * 60 - elapsed + 2   # +2s buffer after bar close
+        log.info(f"  Sleeping {wait}s until next {bar_minutes}-min bar close...")
         time.sleep(wait)
 
 
