@@ -143,8 +143,28 @@ class StockConfig:
 
     # Risk / sizing
     capital_per_stock:  float = 50_000.0   # ₹ allocated per stock per day
-    stop_loss_pct:      float = 0.008       # raised 0.6%→0.8%: give trade more room
+    stop_loss_pct:      float = 0.010       # initial stop 1.0% (wider — trailing will tighten)
     max_trades_per_day: int   = 3           # cap trades per stock per day
+
+    # ── Adaptive trailing stop ────────────────────────────────────────────────
+    # Three-stage stop management replaces the blunt fixed stop:
+    #   Stage 1 – initial wide stop at entry  (stop_loss_pct)
+    #   Stage 2 – breakeven: once gain ≥ breakeven_trigger, pull stop to entry
+    #   Stage 3 – trailing: once gain ≥ trail_trigger, trail at trail_pct below peak
+    #
+    # Example with defaults: trade moves +0.5% → stop moves to entry (0% loss max).
+    # Trade moves +0.8% → trailing stop trails 0.6% below peak.
+    # Trade moves +1.2% → trailing stop is at +0.6% (locking in profit).
+    # Result: the -₹515 avg stop loss becomes ~₹0 on trades that first moved in favour.
+    trailing_stop:           bool  = True
+    breakeven_trigger_pct:   float = 0.003   # 0.3% gain → move stop to entry price
+    trail_trigger_pct:       float = 0.005   # 0.5% gain → start trailing stop
+    trail_pct:               float = 0.006   # trail at 0.6% distance from peak price
+
+    # ── Per-stock daily stop limit ────────────────────────────────────────────
+    # After N stop losses on a stock in one day, skip that stock for the rest
+    # of the session. Prevents re-entering a stock that is trending hard against us.
+    max_stops_per_day:       int   = 1       # skip after 1 stop loss per stock/day
 
     # Universe filter
     exclude_commodity:  bool  = True        # drop PSU/commodity stocks
@@ -384,6 +404,7 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
     trades: list[Trade]  = []
     position             = None   # dict or None
     trades_today         = 0
+    stops_today          = 0      # stop losses hit today (gates re-entry on same stock)
     last_date            = None
     confirm_long         = 0      # consecutive bars score >= entry_threshold
     confirm_short        = 0      # consecutive bars score <= -entry_threshold
@@ -406,6 +427,7 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
         if ts.date() != last_date:
             last_date          = ts.date()
             trades_today       = 0
+            stops_today        = 0
             confirm_long       = 0
             confirm_short      = 0
             exit_confirm_count = 0
@@ -490,6 +512,47 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
             exit_confirm_count = 0
             past_min_hold      = True
 
+        # ── Adaptive trailing stop (always active, even during min-hold) ──────
+        # Three-stage logic:
+        #   1. Entry:      stop fixed at entry_price ± stop_loss_pct (wide initial buffer)
+        #   2. Breakeven:  once gain ≥ breakeven_trigger_pct, pull stop to entry
+        #   3. Trailing:   once gain ≥ trail_trigger_pct, trail at trail_pct below/above peak
+        # This converts the flat -₹515 stop losses into ~₹0 on trades that first
+        # moved favourably, and locks in profit on multi-bar winning moves.
+        if position is not None and cfg.trailing_stop:
+            ep   = position['entry_price']
+            side = position['side']
+
+            if side == 'long':
+                # Update peak (highest close seen since entry)
+                if price > position.get('peak_price', ep):
+                    position['peak_price'] = price
+                peak     = position['peak_price']
+                gain_pct = (peak - ep) / ep
+
+                # Stage 3 – trailing stop
+                if gain_pct >= cfg.trail_trigger_pct:
+                    trail_sl = peak * (1 - cfg.trail_pct)
+                    position['sl_price'] = max(position['sl_price'], trail_sl)
+                # Stage 2 – breakeven stop (only tighten, don't loosen)
+                elif gain_pct >= cfg.breakeven_trigger_pct:
+                    position['sl_price'] = max(position['sl_price'], ep)
+
+            else:  # short
+                # Update peak (lowest close seen since entry)
+                if price < position.get('peak_price', ep):
+                    position['peak_price'] = price
+                peak     = position['peak_price']
+                gain_pct = (ep - peak) / ep
+
+                # Stage 3 – trailing stop
+                if gain_pct >= cfg.trail_trigger_pct:
+                    trail_sl = peak * (1 + cfg.trail_pct)
+                    position['sl_price'] = min(position['sl_price'], trail_sl)
+                # Stage 2 – breakeven stop
+                elif gain_pct >= cfg.breakeven_trigger_pct:
+                    position['sl_price'] = min(position['sl_price'], ep)
+
         # ── Check stop-loss (always active, even within min-hold period) ──────
         if position is not None:
             sl_hit = False
@@ -517,15 +580,17 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                 position           = None
                 bars_in_position   = 0
                 exit_confirm_count = 0
-                confirm_long       = 0   # force fresh confirmation after stop
+                confirm_long       = 0
                 confirm_short      = 0
+                stops_today       += 1   # gate: skip this stock for the rest of day
                 past_min_hold      = True
 
         # ── Position management ───────────────────────────────────────────────
         if position is None:
-            # Enter: need confirmed signal + trending regime + not lunch + budget
+            # Enter: confirmed signal + trending regime + not lunch + budget + stop limit
             if (desired is not None and adx_ok and not in_lunch
-                    and trades_today < cfg.max_trades_per_day):
+                    and trades_today < cfg.max_trades_per_day
+                    and stops_today  < cfg.max_stops_per_day):
                 qty  = max(1, int(cfg.capital_per_stock / price))
                 cost = compute_costs(price, qty,
                                      'buy' if desired == 'long' else 'sell', cfg)
@@ -535,6 +600,7 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                     'side':        desired,
                     'entry_time':  ts,
                     'entry_price': price,
+                    'peak_price':  price,   # tracks best price for trailing stop
                     'qty':         qty,
                     'entry_cost':  cost,
                     'sl_price':    sl,
@@ -571,11 +637,9 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
 
                 if cfg.sar_enabled:
                     # ── Classic SAR: immediately flip to opposite side ────────
-                    # CAUTION: creates churn chains in choppy markets.
-                    # Each flip satisfies confirm immediately (confirm already at N)
-                    # so entry is instant with no cooldown. Use only in
-                    # clearly trending conditions with tight ADX filter.
-                    if not in_lunch and adx_ok and trades_today < cfg.max_trades_per_day:
+                    if (not in_lunch and adx_ok
+                            and trades_today < cfg.max_trades_per_day
+                            and stops_today  < cfg.max_stops_per_day):
                         qty  = max(1, int(cfg.capital_per_stock / price))
                         cost = compute_costs(price, qty,
                                              'buy' if desired == 'long' else 'sell', cfg)
@@ -585,6 +649,7 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                             'side':        desired,
                             'entry_time':  ts,
                             'entry_price': price,
+                            'peak_price':  price,
                             'qty':         qty,
                             'entry_cost':  cost,
                             'sl_price':    sl,
@@ -847,8 +912,18 @@ def _parse():
                    help="Disable ADX trend-regime entry filter")
     p.add_argument("--adx-trend-min",     type=float, default=0.25,
                    help="Minimum |f4| (normalized ADX proxy) required for entry (default=0.25)")
-    p.add_argument("--sar",               action="store_true",
+    p.add_argument("--sar",                action="store_true",
                    help="Enable classic stop-and-reverse (default: exit flat, await fresh signal)")
+    p.add_argument("--no-trailing-stop",   action="store_true",
+                   help="Disable adaptive trailing stop (use fixed stop only)")
+    p.add_argument("--breakeven-trigger",  type=float, default=0.003,
+                   help="Gain %% before stop moves to entry price (default=0.3%%)")
+    p.add_argument("--trail-trigger",      type=float, default=0.005,
+                   help="Gain %% before trailing stop activates (default=0.5%%)")
+    p.add_argument("--trail-pct",          type=float, default=0.006,
+                   help="Trailing stop distance from peak price (default=0.6%%)")
+    p.add_argument("--max-stops-day",      type=int,   default=1,
+                   help="Max stop losses per stock per day before skipping it (default=1)")
     p.add_argument("--output-dir",       type=str,   default="results_stocks")
     p.add_argument("--workers",          type=int,   default=8,
                    help="Parallel workers for per-stock factor computation")
@@ -860,21 +935,26 @@ if __name__ == "__main__":
     os.makedirs(args.output_dir, exist_ok=True)
 
     cfg = StockConfig(
-        bar_minutes        = args.bar_minutes,
-        capital_per_stock  = args.capital,
-        entry_threshold    = args.entry_thr,
-        exit_threshold     = args.exit_thr,
-        stop_loss_pct      = args.stop_pct,
-        min_confirm_bars   = args.min_confirm_bars,
-        exit_confirm_bars  = args.exit_confirm_bars,
-        min_hold_bars      = args.min_hold_bars,
-        max_trades_per_day = args.max_trades_day,
-        lunch_filter       = not args.no_lunch_filter,
-        exclude_commodity  = not args.include_commodity,
-        use_ic_weights     = not args.no_ic_weights,
-        adx_trend_filter   = not args.no_adx_filter,
-        adx_trend_min      = args.adx_trend_min,
-        sar_enabled        = args.sar,
+        bar_minutes            = args.bar_minutes,
+        capital_per_stock      = args.capital,
+        entry_threshold        = args.entry_thr,
+        exit_threshold         = args.exit_thr,
+        stop_loss_pct          = args.stop_pct,
+        min_confirm_bars       = args.min_confirm_bars,
+        exit_confirm_bars      = args.exit_confirm_bars,
+        min_hold_bars          = args.min_hold_bars,
+        max_trades_per_day     = args.max_trades_day,
+        lunch_filter           = not args.no_lunch_filter,
+        exclude_commodity      = not args.include_commodity,
+        use_ic_weights         = not args.no_ic_weights,
+        adx_trend_filter       = not args.no_adx_filter,
+        adx_trend_min          = args.adx_trend_min,
+        sar_enabled            = args.sar,
+        trailing_stop          = not args.no_trailing_stop,
+        breakeven_trigger_pct  = args.breakeven_trigger,
+        trail_trigger_pct      = args.trail_trigger,
+        trail_pct              = args.trail_pct,
+        max_stops_per_day      = args.max_stops_day,
     )
 
     log.info(
