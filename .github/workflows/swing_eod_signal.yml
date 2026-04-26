@@ -1,0 +1,163 @@
+name: Swing EOD Signal (3:15 PM IST daily)
+
+# ── Workflow ────────────────────────────────────────────────────────────────
+# Runs daily at market close (3:15 PM IST = 9:45 AM UTC).
+# 1. Fetches today's daily bar for all Nifty 50 stocks via yfinance
+# 2. Computes multi-factor composite score on full daily history
+# 3. Compares today's signal to yesterday's persisted state
+# 4. Outputs a "changes" file: new entries, exits, holds for tomorrow's open
+# 5. Sends Telegram alert with what to do at 9:15 AM tomorrow
+#
+# Paper trade execution (no real orders):
+#   Telegram message lists:
+#     🟢 ENTER LONG  INFY  @ tomorrow open
+#     🔴 ENTER SHORT AXISBANK @ tomorrow open
+#     ⬜ EXIT  HDFCBANK       @ tomorrow open
+#     ⏸  HOLD (no change)    — 12 stocks
+# ───────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    # 9:45 AM UTC = 3:15 PM IST, Mon-Fri
+    - cron: "45 9 * * 1-5"
+
+  workflow_dispatch:
+    inputs:
+      paper_trade:
+        description: "Paper trade only (no real orders)?"
+        default: "true"
+        required: false
+
+concurrency:
+  group: swing-eod-signal
+  cancel-in-progress: true
+
+jobs:
+  eod_signal:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Guard: only run on weekdays ───────────────────────────────────
+      - name: Check market day (IST)
+        id: market_check
+        run: |
+          DAY_IST=$(TZ="Asia/Kolkata" date +%u)   # 1=Mon … 5=Fri 6=Sat 7=Sun
+          echo "Day of week (IST): $DAY_IST"
+          if [ "$DAY_IST" -gt 5 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip if weekend
+        if: steps.market_check.outputs.skip == 'true'
+        run: echo "Weekend — skipping." && exit 0
+
+      # ── 2. Setup ──────────────────────────────────────────────────────────
+      - uses: actions/checkout@v4
+        if: steps.market_check.outputs.skip != 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.market_check.outputs.skip != 'true'
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        if: steps.market_check.outputs.skip != 'true'
+        run: pip install -r requirements.txt
+
+      # ── 3. Restore previous signal state ────────────────────────────────
+      - name: Restore swing signal state
+        if: steps.market_check.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: state_swing/
+          key: swing-state-${{ github.run_id }}
+          restore-keys: |
+            swing-state-
+
+      # ── 4. Generate EOD signals ──────────────────────────────────────────
+      - name: Generate swing signals
+        if: steps.market_check.outputs.skip != 'true'
+        run: |
+          mkdir -p results_swing state_swing
+          python swing_backtest.py \
+            --years 1 \
+            --output-dir results_swing
+          echo "--- signal summary ---"
+          cat results_swing/swing_summary.json 2>/dev/null || echo "(no summary)"
+
+      # ── 5. Compute signal changes and send Telegram alert ────────────────
+      - name: Send Telegram alert
+        if: steps.market_check.outputs.skip != 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          PAPER_TRADE:        ${{ github.event.inputs.paper_trade || 'true' }}
+        run: |
+          python - <<'PYEOF'
+          import json, os, requests, pandas as pd
+          from datetime import date
+
+          TRADES_CSV   = "results_swing/swing_trades.csv"
+          BOT_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
+          CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID", "")
+          PAPER        = os.getenv("PAPER_TRADE", "true").lower() == "true"
+
+          def send(msg):
+              if not BOT_TOKEN or not CHAT_ID:
+                  print("[Telegram] No credentials — message would be:")
+                  print(msg)
+                  return
+              requests.post(
+                  f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                  json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
+                  timeout=10,
+              )
+
+          try:
+              df = pd.read_csv(TRADES_CSV)
+              # Trades whose entry_date == today are NEW entries for tomorrow's open
+              today = str(date.today())
+              new_entries  = df[df['entry_date'] == today]
+              new_exits    = df[df['exit_date']  == today]
+              n_open       = len(df[df['exit_date'] > today])
+
+              label = "📋 PAPER" if PAPER else "🔴 LIVE"
+              lines = [f"<b>{label} Swing Signal — {today}</b>",
+                       f"Execute at tomorrow's open (9:15 AM IST)", ""]
+
+              if new_entries.empty and new_exits.empty:
+                  lines.append("⏸  No signal changes today — hold existing positions")
+              else:
+                  for _, row in new_entries.iterrows():
+                      icon = "🟢" if row['side'] == 'long' else "🔴"
+                      lines.append(f"{icon} ENTER {row['side'].upper():5s}  "
+                                   f"{row['symbol']}  ₹{row['entry_price']:,.1f}")
+                  for _, row in new_exits.iterrows():
+                      lines.append(f"⬜ EXIT   {row['symbol']}  "
+                                   f"(reason: {row['exit_reason']})")
+
+              lines += ["", f"📊 Open positions: {n_open}"]
+              send("\n".join(lines))
+
+          except Exception as e:
+              send(f"⚠️ Swing signal error: {e}")
+          PYEOF
+
+      # ── 6. Save state ────────────────────────────────────────────────────
+      - name: Save swing signal state
+        if: steps.market_check.outputs.skip != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: state_swing/
+          key: swing-state-${{ github.run_id }}
+
+      # ── 7. Upload signal artifact ────────────────────────────────────────
+      - uses: actions/upload-artifact@v4
+        if: steps.market_check.outputs.skip != 'true'
+        with:
+          name: swing-signal-${{ github.run_number }}
+          path: results_swing/
+          retention-days: 30

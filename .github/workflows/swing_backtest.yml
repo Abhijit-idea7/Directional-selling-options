@@ -1,0 +1,122 @@
+name: Nifty 50 Swing Backtest (Daily Bars)
+
+# ── What this does ──────────────────────────────────────────────────────────
+# Runs the swing/positional backtest on 5 years of daily OHLCV data.
+# Each stock gets its own factor signal computed on daily bars.
+# Entry: next-day OPEN after signal appears.
+# Exit:  next-day OPEN when signal fades, reverses, or stop is hit.
+# Costs: Zerodha delivery model (zero brokerage, 0.1% STT each way).
+#
+# For LIVE EOD signals, run the live_swing_signal.yml workflow instead
+# (triggers at 3:15 PM IST and outputs today's signal changes).
+# ───────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      years:
+        description: "Years of daily history (default=5)"
+        default: "5"
+      capital:
+        description: "Capital per stock (₹)"
+        default: "50000"
+      entry_threshold:
+        description: "Entry threshold (0.25 recommended for daily bars)"
+        default: "0.25"
+      exit_threshold:
+        description: "Exit threshold (0.10)"
+        default: "0.10"
+      stop_pct:
+        description: "Initial stop-loss % (3% for swing)"
+        default: "0.030"
+      min_confirm:
+        description: "Consecutive days above threshold before entry"
+        default: "2"
+      min_hold:
+        description: "Minimum holding days"
+        default: "2"
+      max_hold:
+        description: "Maximum holding days before forced exit"
+        default: "15"
+      trailing_stop:
+        description: "Enable adaptive trailing stop?"
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      ic_weights:
+        description: "Enable IC-based dynamic factor weights?"
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      exclude_commodity:
+        description: "Exclude commodity/PSU stocks?"
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      symbols:
+        description: "Comma-separated symbols (blank = all filtered)"
+        default: ""
+
+  push:
+    branches: [main]
+    paths:
+      - "swing_backtest.py"
+
+jobs:
+  swing_backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run swing backtest
+        run: |
+          mkdir -p results_swing
+
+          CMD="python swing_backtest.py \
+            --years   ${{ github.event.inputs.years || '5' }} \
+            --capital ${{ github.event.inputs.capital || '50000' }} \
+            --entry-thr  ${{ github.event.inputs.entry_threshold || '0.25' }} \
+            --exit-thr   ${{ github.event.inputs.exit_threshold  || '0.10' }} \
+            --stop-pct   ${{ github.event.inputs.stop_pct        || '0.030' }} \
+            --min-confirm ${{ github.event.inputs.min_confirm || '2' }} \
+            --min-hold    ${{ github.event.inputs.min_hold    || '2' }} \
+            --max-hold    ${{ github.event.inputs.max_hold    || '15' }} \
+            --output-dir results_swing"
+
+          if [ "${{ github.event.inputs.trailing_stop || 'true' }}" = "false" ]; then
+            CMD="$CMD --no-trailing-stop"
+          fi
+
+          if [ "${{ github.event.inputs.ic_weights || 'true' }}" = "false" ]; then
+            CMD="$CMD --no-ic-weights"
+          fi
+
+          if [ "${{ github.event.inputs.exclude_commodity || 'true' }}" = "false" ]; then
+            CMD="$CMD --include-commodity"
+          fi
+
+          if [ -n "${{ github.event.inputs.symbols }}" ]; then
+            CMD="$CMD --symbols ${{ github.event.inputs.symbols }}"
+          fi
+
+          echo "Running: $CMD"
+          eval $CMD
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: swing-backtest-${{ github.run_number }}
+          path: results_swing/
+          retention-days: 60
