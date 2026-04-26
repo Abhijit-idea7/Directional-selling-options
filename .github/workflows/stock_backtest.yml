@@ -18,13 +18,39 @@ on:
         description: "Capital per stock (₹)"
         default: "50000"
       entry_threshold:
-        description: "Entry threshold (0.25 recommended)"
-        default: "0.25"
+        description: "Entry threshold (0.35 = optimised default)"
+        default: "0.35"
+      exit_threshold:
+        description: "Exit threshold (0.20 = optimised default)"
+        default: "0.20"
       stop_pct:
         description: "Stop-loss % (e.g. 0.006 = 0.6%)"
         default: "0.006"
+      min_confirm_bars:
+        description: "Consecutive bars above threshold before entry (0 = off)"
+        default: "3"
+      min_hold_bars:
+        description: "Minimum bars to hold before signal-driven exit (0 = off)"
+        default: "5"
+      max_trades_day:
+        description: "Max trades per stock per day (reduces overtrading)"
+        default: "3"
+      lunch_filter:
+        description: "Skip entries during 12:00-13:30 lunch hour?"
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      exclude_commodity:
+        description: "Exclude commodity/PSU stocks (COALINDIA, ONGC, etc.)?"
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
       symbols:
-        description: "Comma-separated symbols to test (blank = all 50)"
+        description: "Comma-separated symbols to test (blank = all filtered)"
         default: ""
   push:
     branches: [main]
@@ -48,18 +74,33 @@ jobs:
         run: |
           mkdir -p results_stocks
 
-          # Build the command — only pass --synthetic if explicitly chosen
+          # ── Base command ───────────────────────────────────────────
           CMD="python nifty50_intraday_backtest.py"
 
+          # ── Data source ────────────────────────────────────────────
           if [ "${{ github.event.inputs.data_source || 'yfinance' }}" = "synthetic" ]; then
             CMD="$CMD --synthetic --days ${{ github.event.inputs.days || '40' }}"
           fi
 
+          # ── Core parameters ────────────────────────────────────────
           CMD="$CMD \
-            --capital ${{ github.event.inputs.capital || '50000' }} \
-            --entry-thr ${{ github.event.inputs.entry_threshold || '0.25' }} \
-            --stop-pct ${{ github.event.inputs.stop_pct || '0.006' }} \
+            --capital          ${{ github.event.inputs.capital || '50000' }} \
+            --entry-thr        ${{ github.event.inputs.entry_threshold || '0.35' }} \
+            --exit-thr         ${{ github.event.inputs.exit_threshold || '0.20' }} \
+            --stop-pct         ${{ github.event.inputs.stop_pct || '0.006' }} \
+            --min-confirm-bars ${{ github.event.inputs.min_confirm_bars || '3' }} \
+            --min-hold-bars    ${{ github.event.inputs.min_hold_bars || '5' }} \
+            --max-trades-day   ${{ github.event.inputs.max_trades_day || '3' }} \
             --output-dir results_stocks"
+
+          # ── Optional filters ───────────────────────────────────────
+          if [ "${{ github.event.inputs.lunch_filter || 'true' }}" = "false" ]; then
+            CMD="$CMD --no-lunch-filter"
+          fi
+
+          if [ "${{ github.event.inputs.exclude_commodity || 'true' }}" = "false" ]; then
+            CMD="$CMD --include-commodity"
+          fi
 
           if [ -n "${{ github.event.inputs.symbols }}" ]; then
             CMD="$CMD --symbols ${{ github.event.inputs.symbols }}"
