@@ -1,18 +1,20 @@
 name: Live Signal (2-min bars, 5-min GHA poll)
 
-# ── Bar interval vs poll interval ──────────────────────────────────────────────
-# Strategy uses 2-minute OHLCV bars for faster, more dynamic signals.
-# GitHub Actions minimum cron granularity is 5 minutes (platform limit).
+# ── How paper trading works ────────────────────────────────────────────────────
+# Each run (every 5 min during market hours):
+#   1. fetch_data.py  → pulls today's real Nifty 2-min bars
+#                       source: yfinance (free, no credentials needed) OR
+#                               broker API (if BROKER_ACCESS_TOKEN is set)
+#   2. strategy.py    → computes 10 factors + composite score on real data
+#                       outputs results/current_signal.json
+#   3. executor.py    → compares new signal to last position (in state/)
+#                       places paper or live order if signal changed
 #
-# Resolution:
-#   Each workflow run fetches ALL 2-min bars generated since the last run
-#   (typically 2–3 bars). Signals are computed on each bar; the most recent
-#   one drives the order decision. This means signals react to 2-min price
-#   action even though the GHA trigger fires every 5 min.
+# For PAPER TRADE (default): no orders are placed, but Telegram alerts fire
+# and state/position.json tracks the simulated position.
 #
-# For TRUE 2-min execution (signal checked exactly at every bar close):
-#   Run live_trading_adapter.py as a continuous process on a VPS/server.
-#   The adapter's built-in _sleep_to_next_bar(2) handles precise bar timing.
+# GitHub Actions minimum cron = 5 min. Signals use 2-min bar data so each
+# 5-min run processes 2–3 new bars and acts on the most recent one.
 # ──────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -29,27 +31,29 @@ on:
   workflow_dispatch:
     inputs:
       paper_trade:
-        description: "Paper trade (true/false)"
+        description: "Paper trade? (true = no real orders)"
         default: "true"
         required: false
 
 concurrency:
   group: live-signal
-  cancel-in-progress: true   # prevent overlapping runs if GHA drifts
+  cancel-in-progress: true
 
 jobs:
   signal:
     runs-on: ubuntu-latest
+
     steps:
+      # ── 1. Guard: skip outside market hours ───────────────────────────────
       - name: Check market hours (IST)
         id: market_check
         run: |
           HOUR_IST=$(TZ="Asia/Kolkata" date +%H)
           MIN_IST=$(TZ="Asia/Kolkata" date +%M)
           TIME_INT=$((HOUR_IST * 100 + MIN_IST))
-          echo "IST time: ${HOUR_IST}:${MIN_IST} (${TIME_INT})"
-          if [ "$TIME_INT" -lt 915 ] || [ "$TIME_INT" -gt 1515 ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "IST time: ${HOUR_IST}:${MIN_IST}"
+          if [ "$TIME_INT" -lt 930 ] || [ "$TIME_INT" -gt 1515 ]; then
+            echo "skip=true"  >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
@@ -58,6 +62,7 @@ jobs:
         if: steps.market_check.outputs.skip == 'true'
         run: echo "Outside market hours — skipping." && exit 0
 
+      # ── 2. Setup ──────────────────────────────────────────────────────────
       - name: Checkout
         if: steps.market_check.outputs.skip != 'true'
         uses: actions/checkout@v4
@@ -73,7 +78,7 @@ jobs:
         if: steps.market_check.outputs.skip != 'true'
         run: pip install -r requirements.txt
 
-      # ── Restore position state from previous run ──────────────────────────
+      # ── 3. Restore position state from last run ───────────────────────────
       - name: Restore position state
         if: steps.market_check.outputs.skip != 'true'
         uses: actions/cache@v4
@@ -83,26 +88,34 @@ jobs:
           restore-keys: |
             position-state-
 
-      # ── Generate 2-min bar signal ─────────────────────────────────────────
-      # Fetches last ~5 min of 2-min bars from broker, computes composite
-      # score on each bar, outputs current_signal.json with the latest signal.
-      - name: Generate signal
+      # ── 4. Fetch real Nifty 2-min data ────────────────────────────────────
+      # No broker credentials? yfinance (free) is used automatically.
+      # Broker credentials set? Zerodha/Upstox API used for richer volume data.
+      - name: Fetch market data
         if: steps.market_check.outputs.skip != 'true'
         env:
           BROKER_API_KEY:      ${{ secrets.BROKER_API_KEY }}
           BROKER_ACCESS_TOKEN: ${{ secrets.BROKER_ACCESS_TOKEN }}
           BROKER_TYPE:         ${{ secrets.BROKER_TYPE }}
-          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
-          PAPER_TRADE:         ${{ github.event.inputs.paper_trade || 'true' }}
         run: |
-          mkdir -p results state
+          mkdir -p data results state
+          python fetch_data.py --bar-minutes 2 --output data/today_2min.csv
+          echo "--- data preview ---"
+          head -5 data/today_2min.csv
+
+      # ── 5. Compute composite signal on real data ──────────────────────────
+      - name: Generate signal
+        if: steps.market_check.outputs.skip != 'true'
+        run: |
           python multi_factor_nifty_strategy.py \
             --mode signal \
             --bar-minutes 2 \
+            --data-csv data/today_2min.csv \
             --output-dir results
+          echo "--- signal ---"
+          cat results/current_signal.json
 
-      # ── Execute order if signal changed ───────────────────────────────────
+      # ── 6. Execute paper / live order if signal changed ───────────────────
       - name: Execute signal
         if: steps.market_check.outputs.skip != 'true'
         env:
@@ -113,10 +126,13 @@ jobs:
           TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
           PAPER_TRADE:         ${{ github.event.inputs.paper_trade || 'true' }}
           STRIKE_STEP:         "50"
+          LOT_SIZE:            "25"
+          LOTS:                "1"
+          STOP_LOSS_PCT:       "0.008"
         run: |
           python signal_executor.py --state-dir state --signal-dir results
 
-      # ── Save position state for next run ──────────────────────────────────
+      # ── 7. Persist state for next run ─────────────────────────────────────
       - name: Save position state
         if: steps.market_check.outputs.skip != 'true'
         uses: actions/cache/save@v4
@@ -124,10 +140,13 @@ jobs:
           path: state/
           key: position-state-${{ github.run_id }}
 
+      # ── 8. Upload signal snapshot as artifact ─────────────────────────────
       - name: Upload signal snapshot
         if: steps.market_check.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: signal-${{ github.run_number }}
-          path: results/current_signal.json
+          path: |
+            results/current_signal.json
+            state/position.json
           retention-days: 7
