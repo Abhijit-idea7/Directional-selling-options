@@ -120,23 +120,30 @@ class StockConfig:
     exit_threshold:     float = 0.28        # raised — score must nearly-reverse before exit
 
     # Signal quality filters
-    min_confirm_bars:   int   = 3           # N consecutive bars above threshold → entry
+    min_confirm_bars:   int   = 5           # N consecutive bars above threshold → entry
     exit_confirm_bars:  int   = 3           # N consecutive bars below exit_threshold → exit
-    min_hold_bars:      int   = 15          # don't exit within first 15 bars (30 min)
+    min_hold_bars:      int   = 8           # don't exit within first 8 bars (16 min)
     lunch_filter:       bool  = True        # skip 12:00–13:30 entries (low volume)
+
+    # SAR behaviour on signal reversal
+    # False (default): exit to flat, RESET confirm counters, wait for fresh confirmation
+    # True           : immediately reverse into opposite position (classic stop-and-reverse)
+    # Root cause of "no trade count change": SAR=True was instantly re-entering after
+    # every signal_switch, creating long→short→long churn chains with no cooldown.
+    sar_enabled:        bool  = False
 
     # IC-based dynamic factor weighting (Fundamental Law: w ∝ IC × 1/Σ|corr|)
     use_ic_weights:     bool  = True        # enable predictive-power weighting
     ic_lookback:        int   = 60          # bars to estimate rolling IC per factor
     ic_min_obs:         int   = 20          # min observations required to compute IC
 
-    # ADX trend-regime filter: only enter when market is trending
+    # ADX trend-regime filter: only enter when market is clearly trending
     adx_trend_filter:   bool  = True        # require |f4| > adx_trend_min to enter
-    adx_trend_min:      float = 0.10        # normalized ADX threshold (|f4| proxy)
+    adx_trend_min:      float = 0.25        # raised 0.10→0.25: filter choppy regimes
 
     # Risk / sizing
     capital_per_stock:  float = 50_000.0   # ₹ allocated per stock per day
-    stop_loss_pct:      float = 0.006       # 0.6% move against position
+    stop_loss_pct:      float = 0.008       # raised 0.6%→0.8%: give trade more room
     max_trades_per_day: int   = 3           # cap trades per stock per day
 
     # Universe filter
@@ -428,6 +435,8 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                 position           = None
                 bars_in_position   = 0
                 exit_confirm_count = 0
+                confirm_long       = 0   # force fresh confirmation after close
+                confirm_short      = 0
             continue
 
         if np.isnan(score):
@@ -508,6 +517,8 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                 position           = None
                 bars_in_position   = 0
                 exit_confirm_count = 0
+                confirm_long       = 0   # force fresh confirmation after stop
+                confirm_short      = 0
                 past_min_hold      = True
 
         # ── Position management ───────────────────────────────────────────────
@@ -538,7 +549,7 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                 continue
 
             if desired is not None and desired != cur_side:
-                # ── Signal reversal (SAR) ─────────────────────────────────────
+                # ── Signal reversal exit ──────────────────────────────────────
                 exit_cost = compute_costs(price, position['qty'],
                                           'sell' if cur_side == 'long' else 'buy',
                                           cfg)
@@ -557,22 +568,35 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                 position           = None
                 bars_in_position   = 0
                 exit_confirm_count = 0
-                # Immediately open reverse leg (outside lunch only)
-                if not in_lunch and adx_ok and trades_today < cfg.max_trades_per_day:
-                    qty  = max(1, int(cfg.capital_per_stock / price))
-                    cost = compute_costs(price, qty,
-                                         'buy' if desired == 'long' else 'sell', cfg)
-                    sl   = (price * (1 - cfg.stop_loss_pct) if desired == 'long'
-                            else price * (1 + cfg.stop_loss_pct))
-                    position = {
-                        'side':        desired,
-                        'entry_time':  ts,
-                        'entry_price': price,
-                        'qty':         qty,
-                        'entry_cost':  cost,
-                        'sl_price':    sl,
-                    }
-                    trades_today += 1
+
+                if cfg.sar_enabled:
+                    # ── Classic SAR: immediately flip to opposite side ────────
+                    # CAUTION: creates churn chains in choppy markets.
+                    # Each flip satisfies confirm immediately (confirm already at N)
+                    # so entry is instant with no cooldown. Use only in
+                    # clearly trending conditions with tight ADX filter.
+                    if not in_lunch and adx_ok and trades_today < cfg.max_trades_per_day:
+                        qty  = max(1, int(cfg.capital_per_stock / price))
+                        cost = compute_costs(price, qty,
+                                             'buy' if desired == 'long' else 'sell', cfg)
+                        sl   = (price * (1 - cfg.stop_loss_pct) if desired == 'long'
+                                else price * (1 + cfg.stop_loss_pct))
+                        position = {
+                            'side':        desired,
+                            'entry_time':  ts,
+                            'entry_price': price,
+                            'qty':         qty,
+                            'entry_cost':  cost,
+                            'sl_price':    sl,
+                        }
+                        trades_today += 1
+                else:
+                    # ── Flat after reversal: RESET confirm counters ───────────
+                    # Force min_confirm_bars of fresh confirmation before any
+                    # new entry. This breaks the long→short→long churn cycle
+                    # and is the key fix for unchanged trade count.
+                    confirm_long  = 0
+                    confirm_short = 0
 
             elif (desired is None
                   and abs(score) < cfg.exit_threshold
@@ -596,7 +620,10 @@ def backtest_single_stock(symbol: str, df: pd.DataFrame,
                     exit_reason = 'signal_neutral',
                 ))
                 position           = None
+                bars_in_position   = 0
                 exit_confirm_count = 0
+                confirm_long       = 0   # force fresh entry confirmation after flat exit
+                confirm_short      = 0
 
     return trades
 
@@ -802,12 +829,12 @@ def _parse():
     p.add_argument("--exit-thr",         type=float, default=0.20,
                    help="Exit threshold (0.20 default — wider hysteresis band)")
     p.add_argument("--stop-pct",         type=float, default=0.006)
-    p.add_argument("--min-confirm-bars",  type=int,   default=3,
-                   help="Consecutive bars above entry_thr required before entry")
+    p.add_argument("--min-confirm-bars",  type=int,   default=5,
+                   help="Consecutive bars above entry_thr required before entry (default=5)")
     p.add_argument("--exit-confirm-bars", type=int,   default=3,
                    help="Consecutive bars below exit_thr required before signal_neutral exit")
-    p.add_argument("--min-hold-bars",     type=int,   default=15,
-                   help="Minimum bars to hold before any signal-driven exit (default=15=30 min)")
+    p.add_argument("--min-hold-bars",     type=int,   default=8,
+                   help="Minimum bars to hold before signal-driven exit (default=8=16 min)")
     p.add_argument("--max-trades-day",    type=int,   default=3,
                    help="Maximum trades per stock per day")
     p.add_argument("--no-lunch-filter",   action="store_true",
@@ -818,8 +845,10 @@ def _parse():
                    help="Disable IC-based factor weights (use independence-only)")
     p.add_argument("--no-adx-filter",     action="store_true",
                    help="Disable ADX trend-regime entry filter")
-    p.add_argument("--adx-trend-min",     type=float, default=0.10,
-                   help="Minimum |f4| (normalized ADX proxy) required for entry")
+    p.add_argument("--adx-trend-min",     type=float, default=0.25,
+                   help="Minimum |f4| (normalized ADX proxy) required for entry (default=0.25)")
+    p.add_argument("--sar",               action="store_true",
+                   help="Enable classic stop-and-reverse (default: exit flat, await fresh signal)")
     p.add_argument("--output-dir",       type=str,   default="results_stocks")
     p.add_argument("--workers",          type=int,   default=8,
                    help="Parallel workers for per-stock factor computation")
@@ -845,13 +874,18 @@ if __name__ == "__main__":
         use_ic_weights     = not args.no_ic_weights,
         adx_trend_filter   = not args.no_adx_filter,
         adx_trend_min      = args.adx_trend_min,
+        sar_enabled        = args.sar,
     )
 
-    log.info("Config: entry_thr=%.2f  exit_thr=%.2f  min_confirm=%d  "
-             "exit_confirm=%d  min_hold=%d bars  IC_weights=%s  ADX_filter=%s",
-             cfg.entry_threshold, cfg.exit_threshold, cfg.min_confirm_bars,
-             cfg.exit_confirm_bars, cfg.min_hold_bars,
-             cfg.use_ic_weights, cfg.adx_trend_filter)
+    log.info(
+        "Config: entry_thr=%.2f  exit_thr=%.2f  min_confirm=%d  "
+        "exit_confirm=%d  min_hold=%d bars  stop=%.1f%%  "
+        "IC_weights=%s  ADX_filter=%s (min=%.2f)  SAR=%s",
+        cfg.entry_threshold, cfg.exit_threshold, cfg.min_confirm_bars,
+        cfg.exit_confirm_bars, cfg.min_hold_bars, cfg.stop_loss_pct * 100,
+        cfg.use_ic_weights, cfg.adx_trend_filter, cfg.adx_trend_min,
+        cfg.sar_enabled,
+    )
 
     if args.symbols:
         symbols = args.symbols.split(",")
